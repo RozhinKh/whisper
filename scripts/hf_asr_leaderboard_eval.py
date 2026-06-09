@@ -35,7 +35,7 @@ DATASET_CONFIGS = {
     "librispeech_asr": {
         "path": "librispeech_asr",
         "name": "clean",
-        "split": "test.clean",
+        "split": "test",
         "audio_col": "audio",
         "text_col": "text",
         "streaming": True,
@@ -43,7 +43,7 @@ DATASET_CONFIGS = {
     "librispeech_asr_other": {
         "path": "librispeech_asr",
         "name": "other",
-        "split": "test.other",
+        "split": "test",
         "audio_col": "audio",
         "text_col": "text",
         "streaming": True,
