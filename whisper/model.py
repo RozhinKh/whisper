@@ -323,24 +323,6 @@ class Whisper(nn.Module):
             self.dims.n_text_layer,
         )
 
-        # torch.compile for RTX 3090:
-        # Encoder: max-autotune + fullgraph for the fixed-shape (n_mels×3000) path;
-        #   Inductor profiles conv/GEMM tile sizes and emits a single fused graph.
-        # Decoder: reduce-overhead captures CUDA graphs for the single-token
-        #   autoregressive step — fastest mode for variable-length sequences.
-        if hasattr(torch, "compile"):
-            try:
-                self.encoder = torch.compile(
-                    self.encoder, mode="max-autotune", fullgraph=True
-                )
-            except Exception:
-                pass
-            try:
-                self.decoder = torch.compile(
-                    self.decoder, mode="reduce-overhead", fullgraph=False
-                )
-            except Exception:
-                pass
         # use the last half among the decoder layers for time alignment by default;
         # to use a specific set of heads, see `set_alignment_heads()` below.
         all_heads = torch.zeros(

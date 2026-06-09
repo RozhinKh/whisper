@@ -158,4 +158,20 @@ def load_model(
     if alignment_heads is not None:
         model.set_alignment_heads(alignment_heads)
 
-    return model.to(device)
+    model = model.to(device)
+
+    if hasattr(torch, "compile"):
+        try:
+            model.encoder = torch.compile(
+                model.encoder, mode="max-autotune", fullgraph=True
+            )
+        except Exception:
+            pass
+        try:
+            model.decoder = torch.compile(
+                model.decoder, mode="reduce-overhead", fullgraph=False
+            )
+        except Exception:
+            pass
+
+    return model
