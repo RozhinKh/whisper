@@ -105,6 +105,8 @@ def load_model(
     device: Optional[Union[str, torch.device]] = None,
     download_root: str = None,
     in_memory: bool = False,
+    compute_type: str = "float16",
+    use_compile: bool = False,
 ) -> Whisper:
     """
     Load a Whisper ASR model
@@ -120,6 +122,10 @@ def load_model(
         path to download the model files; by default, it uses "~/.cache/whisper"
     in_memory: bool
         whether to preload the model weights into host memory
+    compute_type: str
+        "float16" (default, recommended for CUDA) or "float32"
+    use_compile: bool
+        whether to apply torch.compile (requires PyTorch >= 2.0, adds ~30s warm-up)
 
     Returns
     -------
@@ -132,6 +138,13 @@ def load_model(
     if download_root is None:
         default = os.path.join(os.path.expanduser("~"), ".cache")
         download_root = os.path.join(os.getenv("XDG_CACHE_HOME", default), "whisper")
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+            torch.backends.cuda.enable_flash_sdp(True)
+        if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
 
     if name in _MODELS:
         checkpoint_file = _download(_MODELS[name], download_root, in_memory)
@@ -158,4 +171,15 @@ def load_model(
     if alignment_heads is not None:
         model.set_alignment_heads(alignment_heads)
 
-    return model.to(device)
+    model = model.to(device)
+
+    if compute_type == "float16" and str(device) != "cpu":
+        model = model.half()
+
+    if use_compile:
+        if not hasattr(torch, "compile"):
+            warnings.warn("torch.compile requires PyTorch >= 2.0; skipping.")
+        else:
+            model = torch.compile(model, mode="reduce-overhead")
+
+    return model
