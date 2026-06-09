@@ -173,9 +173,6 @@ def load_model(
 
     model = model.to(device)
 
-    if compute_type == "float16" and str(device) != "cpu":
-        model = model.half()
-
     if use_compile:
         if not hasattr(torch, "compile"):
             warnings.warn("torch.compile requires PyTorch >= 2.0; skipping.")
