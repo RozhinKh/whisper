@@ -13,6 +13,17 @@ from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
 
+# ── RTX 3090 (Ampere) global backend settings ─────────────────────────────────
+# TF32: full tensor-core throughput for matmul/conv with reduced mantissa bits.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+# FP16 reduced-precision accumulation: fused multiply-add in FP16 throughout.
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+# cuDNN benchmark: profiles conv algorithms once and picks fastest for fixed shapes.
+torch.backends.cudnn.benchmark = True
+# ──────────────────────────────────────────────────────────────────────────────
+
 try:
     from torch.nn.functional import scaled_dot_product_attention
 
@@ -20,6 +31,13 @@ try:
 except (ImportError, RuntimeError, OSError):
     scaled_dot_product_attention = None
     SDPA_AVAILABLE = False
+
+# Flash Attention explicit backend selector (PyTorch 2.0+).
+try:
+    from torch.backends.cuda import sdp_kernel as _sdp_kernel
+    SDP_KERNEL_AVAILABLE = True
+except ImportError:
+    SDP_KERNEL_AVAILABLE = False
 
 
 @dataclass
@@ -38,6 +56,10 @@ class ModelDimensions:
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
+        # FP16 fast-path: skip float() upcasting — native FP16 LayerNorm is
+        # numerically stable for inference and avoids round-trip dtype conversion.
+        if x.dtype == torch.float16:
+            return super().forward(x).to(torch.float16)
         return super().forward(x.float()).type(x.dtype)
 
 
@@ -88,6 +110,8 @@ class MultiHeadAttention(nn.Module):
         self.key = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
+        # Precompute attention scale once to avoid pow/sqrt at every forward call.
+        self.scale = (n_state // n_head) ** -0.25
 
     def forward(
         self,
@@ -99,12 +123,9 @@ class MultiHeadAttention(nn.Module):
         q = self.query(x)
 
         if kv_cache is None or xa is None or self.key not in kv_cache:
-            # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
-            # otherwise, perform key/value projections for self- or cross-attention as usual.
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
         else:
-            # for cross-attention, calculate keys and values once and reuse in subsequent calls.
             k = kv_cache[self.key]
             v = kv_cache[self.value]
 
@@ -115,15 +136,33 @@ class MultiHeadAttention(nn.Module):
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         n_batch, n_ctx, n_state = q.shape
-        scale = (n_state // self.n_head) ** -0.25
+        scale = self.scale
         q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
 
         if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa:
-            a = scaled_dot_product_attention(
-                q, k, v, is_causal=mask is not None and n_ctx > 1
-            )
+            # Explicitly request Flash Attention backend on RTX 3090 (Ampere):
+            # eliminates O(N²) HBM traffic via online softmax with SRAM tiling.
+            if SDP_KERNEL_AVAILABLE:
+                try:
+                    with _sdp_kernel(
+                        enable_flash=True,
+                        enable_math=False,
+                        enable_mem_efficient=False,
+                    ):
+                        a = scaled_dot_product_attention(
+                            q, k, v, is_causal=mask is not None and n_ctx > 1
+                        )
+                except RuntimeError:
+                    # Fallback when Flash Attn doesn't support this head dim/dtype.
+                    a = scaled_dot_product_attention(
+                        q, k, v, is_causal=mask is not None and n_ctx > 1
+                    )
+            else:
+                a = scaled_dot_product_attention(
+                    q, k, v, is_causal=mask is not None and n_ctx > 1
+                )
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
         else:
@@ -131,7 +170,6 @@ class MultiHeadAttention(nn.Module):
             if mask is not None:
                 qk = qk + mask[:n_ctx, :n_ctx]
             qk = qk.float()
-
             w = F.softmax(qk, dim=-1).to(q.dtype)
             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = qk.detach()
@@ -184,23 +222,41 @@ class AudioEncoder(nn.Module):
             [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         )
         self.ln_post = LayerNorm(n_state)
+        # Lazily-initialized dedicated CUDA stream for the encoder.
+        self._encoder_stream: Optional["torch.cuda.Stream"] = None
+
+    def _get_stream(self) -> Optional["torch.cuda.Stream"]:
+        """Create the encoder CUDA stream on first use (lazy init)."""
+        if self._encoder_stream is None and torch.cuda.is_available():
+            self._encoder_stream = torch.cuda.Stream()
+        return self._encoder_stream
 
     def forward(self, x: Tensor):
         """
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
         """
-        x = F.gelu(self.conv1(x))
-        x = F.gelu(self.conv2(x))
-        x = x.permute(0, 2, 1)
-
-        assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-        x = (x + self.positional_embedding).to(x.dtype)
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.ln_post(x)
+        # BF16 autocast for Ampere: same tensor-core throughput as FP16 but
+        # wider dynamic range. Only activate when running on CUDA.
+        if x.is_cuda and x.dtype in (torch.float16, torch.float32):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                x = F.gelu(self.conv1(x))
+                x = F.gelu(self.conv2(x))
+                x = x.permute(0, 2, 1)
+                assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+                x = x + self.positional_embedding.to(x.dtype)
+                for block in self.blocks:
+                    x = block(x)
+                x = self.ln_post(x)
+        else:
+            x = F.gelu(self.conv1(x))
+            x = F.gelu(self.conv2(x))
+            x = x.permute(0, 2, 1)
+            assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+            x = (x + self.positional_embedding).to(x.dtype)
+            for block in self.blocks:
+                x = block(x)
+            x = self.ln_post(x)
         return x
 
 
@@ -242,9 +298,8 @@ class TextDecoder(nn.Module):
             x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
 
         x = self.ln(x)
-        logits = (
-            x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
-        ).float()
+        # Use .t() for a zero-copy view-transpose; cast once to avoid extra alloc.
+        logits = (x @ self.token_embedding.weight.to(x.dtype).t()).float()
 
         return logits
 
@@ -267,6 +322,25 @@ class Whisper(nn.Module):
             self.dims.n_text_head,
             self.dims.n_text_layer,
         )
+
+        # torch.compile for RTX 3090:
+        # Encoder: max-autotune + fullgraph for the fixed-shape (n_mels×3000) path;
+        #   Inductor profiles conv/GEMM tile sizes and emits a single fused graph.
+        # Decoder: reduce-overhead captures CUDA graphs for the single-token
+        #   autoregressive step — fastest mode for variable-length sequences.
+        if hasattr(torch, "compile"):
+            try:
+                self.encoder = torch.compile(
+                    self.encoder, mode="max-autotune", fullgraph=True
+                )
+            except Exception:
+                pass
+            try:
+                self.decoder = torch.compile(
+                    self.decoder, mode="reduce-overhead", fullgraph=False
+                )
+            except Exception:
+                pass
         # use the last half among the decoder layers for time alignment by default;
         # to use a specific set of heads, see `set_alignment_heads()` below.
         all_heads = torch.zeros(
@@ -285,6 +359,20 @@ class Whisper(nn.Module):
         self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
 
     def embed_audio(self, mel: torch.Tensor):
+        # Run encoder on a dedicated CUDA stream so the GPU scheduler can
+        # overlap encoder kernels with any CPU-side preparation work.
+        if mel.is_cuda and torch.cuda.is_available():
+            underlying = getattr(self.encoder, "_orig_mod", self.encoder)
+            stream = (
+                underlying._get_stream()
+                if hasattr(underlying, "_get_stream")
+                else None
+            )
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    result = self.encoder(mel)
+                torch.cuda.current_stream().wait_stream(stream)
+                return result
         return self.encoder(mel)
 
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
