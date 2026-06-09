@@ -32,12 +32,6 @@ except (ImportError, RuntimeError, OSError):
     scaled_dot_product_attention = None
     SDPA_AVAILABLE = False
 
-# Flash Attention explicit backend selector (PyTorch 2.0+).
-try:
-    from torch.backends.cuda import sdp_kernel as _sdp_kernel
-    SDP_KERNEL_AVAILABLE = True
-except ImportError:
-    SDP_KERNEL_AVAILABLE = False
 
 
 @dataclass
@@ -142,27 +136,12 @@ class MultiHeadAttention(nn.Module):
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
 
         if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa:
-            # Explicitly request Flash Attention backend on RTX 3090 (Ampere):
-            # eliminates O(N²) HBM traffic via online softmax with SRAM tiling.
-            if SDP_KERNEL_AVAILABLE:
-                try:
-                    with _sdp_kernel(
-                        enable_flash=True,
-                        enable_math=False,
-                        enable_mem_efficient=False,
-                    ):
-                        a = scaled_dot_product_attention(
-                            q, k, v, is_causal=mask is not None and n_ctx > 1
-                        )
-                except RuntimeError:
-                    # Fallback when Flash Attn doesn't support this head dim/dtype.
-                    a = scaled_dot_product_attention(
-                        q, k, v, is_causal=mask is not None and n_ctx > 1
-                    )
-            else:
-                a = scaled_dot_product_attention(
-                    q, k, v, is_causal=mask is not None and n_ctx > 1
-                )
+            # scaled_dot_product_attention auto-selects Flash Attention on Ampere
+            # when inputs are fp16/bf16 and head_dim <= 128. The sdp_kernel
+            # context manager is not traceable by torch.compile(fullgraph=True).
+            a = scaled_dot_product_attention(
+                q, k, v, is_causal=mask is not None and n_ctx > 1
+            )
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
         else:
