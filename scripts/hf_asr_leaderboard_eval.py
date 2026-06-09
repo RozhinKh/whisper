@@ -101,11 +101,7 @@ def main():
     print(f"Dataset   : {args.dataset}")
     print()
 
-    model = whisper.load_model(
-        args.model,
-        compute_type=args.compute_type,
-        use_compile=args.use_compile,
-    )
+    model = whisper.load_model(args.model)
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]
