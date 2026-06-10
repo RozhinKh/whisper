@@ -50,10 +50,6 @@ class ModelDimensions:
 
 class LayerNorm(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
-        # FP16 fast-path: skip float() upcasting — native FP16 LayerNorm is
-        # numerically stable for inference and avoids round-trip dtype conversion.
-        if x.dtype == torch.float16:
-            return super().forward(x).to(torch.float16)
         return super().forward(x.float()).type(x.dtype)
 
 
