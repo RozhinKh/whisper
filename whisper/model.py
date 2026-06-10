@@ -211,29 +211,14 @@ class AudioEncoder(nn.Module):
         x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
             the mel spectrogram of the audio
         """
-        # BF16 autocast for Ampere: same tensor-core throughput as FP16 but
-        # wider dynamic range. Only activate when running on CUDA.
-        if x.is_cuda and x.dtype in (torch.float16, torch.float32):
-            out_dtype = x.dtype
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                x = F.gelu(self.conv1(x))
-                x = F.gelu(self.conv2(x))
-                x = x.permute(0, 2, 1)
-                assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-                x = x + self.positional_embedding.to(x.dtype)
-                for block in self.blocks:
-                    x = block(x)
-                x = self.ln_post(x)
-            x = x.to(out_dtype)
-        else:
-            x = F.gelu(self.conv1(x))
-            x = F.gelu(self.conv2(x))
-            x = x.permute(0, 2, 1)
-            assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-            x = (x + self.positional_embedding).to(x.dtype)
-            for block in self.blocks:
-                x = block(x)
-            x = self.ln_post(x)
+        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv2(x))
+        x = x.permute(0, 2, 1)
+        assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+        x = (x + self.positional_embedding).to(x.dtype)
+        for block in self.blocks:
+            x = block(x)
+        x = self.ln_post(x)
         return x
 
 
