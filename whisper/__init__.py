@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from .audio import load_audio, log_mel_spectrogram, pad_or_trim
 from .decoding import DecodingOptions, DecodingResult, decode, detect_language
-from .model import ModelDimensions, Whisper
+from .model import LayerNorm, ModelDimensions, Whisper
 from .transcribe import transcribe
 from .version import __version__
 
@@ -160,16 +160,14 @@ def load_model(
 
     model = model.to(device)
 
-    # torch.compile with reduce-overhead: captures CUDA graphs to eliminate
-    # kernel launch overhead. Compiled kernels are cached to disk after first run.
-    if device == "cuda" and hasattr(torch, "compile"):
-        try:
-            model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
-        except Exception:
-            pass
-        try:
-            model.decoder = torch.compile(model.decoder, mode="reduce-overhead")
-        except Exception:
-            pass
+    # Store all weights in FP16 to halve memory bandwidth on every forward call.
+    # The custom Linear/Conv1d do weight.to(x.dtype) per call — FP16 weights
+    # make that a no-op when running fp16 inference.
+    # LayerNorm weights stay FP32 because forward() upcasts input to float32.
+    if device == "cuda":
+        model.half()
+        for m in model.modules():
+            if isinstance(m, LayerNorm):
+                m.float()
 
     return model
