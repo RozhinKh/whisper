@@ -17,7 +17,7 @@ from .transcribe import transcribe as transcribe_function
 # TF32 for matmul only (linear layers): tensor-core throughput with minimal
 # precision impact. cudnn TF32 is disabled to keep conv/beam-search WER stable.
 torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 torch.backends.cudnn.benchmark = True

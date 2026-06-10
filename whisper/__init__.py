@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from .audio import load_audio, log_mel_spectrogram, pad_or_trim
 from .decoding import DecodingOptions, DecodingResult, decode, detect_language
-from .model import LayerNorm, ModelDimensions, Whisper
+from .model import ModelDimensions, Whisper
 from .transcribe import transcribe
 from .version import __version__
 
@@ -158,16 +158,4 @@ def load_model(
     if alignment_heads is not None:
         model.set_alignment_heads(alignment_heads)
 
-    model = model.to(device)
-
-    # Store all weights in FP16 to halve memory bandwidth on every forward call.
-    # The custom Linear/Conv1d do weight.to(x.dtype) per call — FP16 weights
-    # make that a no-op when running fp16 inference.
-    # LayerNorm weights stay FP32 because forward() upcasts input to float32.
-    if device == "cuda":
-        model.half()
-        for m in model.modules():
-            if isinstance(m, LayerNorm):
-                m.float()
-
-    return model
+    return model.to(device)
