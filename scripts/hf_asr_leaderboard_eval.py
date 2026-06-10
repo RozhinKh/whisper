@@ -86,6 +86,8 @@ def main():
                         choices=list(DATASET_CONFIGS.keys()))
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Cap number of samples (None = full dataset)")
+    parser.add_argument("--concat-duration", type=float, default=None,
+                        help="Concatenate samples into one audio of this length (seconds) and transcribe as a single file")
     parser.add_argument("--compute-type", default="float16",
                         choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
@@ -118,28 +120,34 @@ def main():
     total_audio_s, total_infer_s = 0.0, 0.0
     n = 0
 
-    for sample in dataset:
-        if args.max_samples and n >= args.max_samples:
-            break
+    if args.concat_duration:
+        # Collect samples until we have enough audio, then transcribe as one long file
+        target_s = args.concat_duration
+        chunks, refs, sr = [], [], None
+        for sample in dataset:
+            arr = np.array(sample[cfg["audio_col"]]["array"], dtype=np.float32)
+            sr = sample[cfg["audio_col"]]["sampling_rate"]
+            chunks.append(arr)
+            refs.append(sample[cfg["text_col"]])
+            if sum(len(c) for c in chunks) / sr >= target_s:
+                break
 
-        audio_array = np.array(sample[cfg["audio_col"]]["array"], dtype=np.float32)
-        sampling_rate = sample[cfg["audio_col"]]["sampling_rate"]
-        reference = sample[cfg["text_col"]]
-        duration_s = len(audio_array) / sampling_rate
+        audio_array = np.concatenate(chunks)
+        duration_s = len(audio_array) / sr
+        reference = " ".join(refs)
+        print(f"Concatenated audio: {duration_s:.1f}s from {len(chunks)} samples")
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             if device == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
-
             result = model.transcribe(
                 audio_array,
                 language=args.language,
                 beam_size=args.beam_size,
                 fp16=(args.compute_type == "float16"),
             )
-
             if device == "cuda":
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - t0
@@ -147,13 +155,47 @@ def main():
         hypothesis = result["text"].strip()
         hypotheses.append(normalizer(hypothesis))
         references.append(normalizer(reference))
-        total_audio_s += duration_s
-        total_infer_s += elapsed
-        n += 1
+        total_audio_s = duration_s
+        total_infer_s = elapsed
+        n = 1
+        print(f"RTF={rtf(duration_s, elapsed):.4f}  elapsed={elapsed:.1f}s")
+    else:
+        for sample in dataset:
+            if args.max_samples and n >= args.max_samples:
+                break
 
-        if n % 10 == 0 or n == 1:
-            running_wer = 100 * compute_wer(references, hypotheses)
-            print(f"[{n:4d}] WER={running_wer:.2f}%  RTF={rtf(duration_s, elapsed):.3f}")
+            audio_array = np.array(sample[cfg["audio_col"]]["array"], dtype=np.float32)
+            sampling_rate = sample[cfg["audio_col"]]["sampling_rate"]
+            reference = sample[cfg["text_col"]]
+            duration_s = len(audio_array) / sampling_rate
+
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
+                result = model.transcribe(
+                    audio_array,
+                    language=args.language,
+                    beam_size=args.beam_size,
+                    fp16=(args.compute_type == "float16"),
+                )
+
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                elapsed = time.perf_counter() - t0
+
+            hypothesis = result["text"].strip()
+            hypotheses.append(normalizer(hypothesis))
+            references.append(normalizer(reference))
+            total_audio_s += duration_s
+            total_infer_s += elapsed
+            n += 1
+
+            if n % 10 == 0 or n == 1:
+                running_wer = 100 * compute_wer(references, hypotheses)
+                print(f"[{n:4d}] WER={running_wer:.2f}%  RTF={rtf(duration_s, elapsed):.3f}")
 
     word_error_rate = 100 * compute_wer(references, hypotheses)
     overall_rtf = rtf(total_audio_s, total_infer_s)
