@@ -158,4 +158,18 @@ def load_model(
     if alignment_heads is not None:
         model.set_alignment_heads(alignment_heads)
 
-    return model.to(device)
+    model = model.to(device)
+
+    # torch.compile with reduce-overhead: captures CUDA graphs to eliminate
+    # kernel launch overhead. Compiled kernels are cached to disk after first run.
+    if device == "cuda" and hasattr(torch, "compile"):
+        try:
+            model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
+        except Exception:
+            pass
+        try:
+            model.decoder = torch.compile(model.decoder, mode="reduce-overhead")
+        except Exception:
+            pass
+
+    return model

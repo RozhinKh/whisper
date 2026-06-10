@@ -14,13 +14,12 @@ from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
 
 # ── RTX 3090 (Ampere) global backend settings ─────────────────────────────────
-# TF32: full tensor-core throughput for matmul/conv with reduced mantissa bits.
+# TF32 for matmul only (linear layers): tensor-core throughput with minimal
+# precision impact. cudnn TF32 is disabled to keep conv/beam-search WER stable.
 torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = False
 torch.set_float32_matmul_precision("high")
-# FP16 reduced-precision accumulation: fused multiply-add in FP16 throughout.
 torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-# cuDNN benchmark: profiles conv algorithms once and picks fastest for fixed shapes.
 torch.backends.cudnn.benchmark = True
 # ──────────────────────────────────────────────────────────────────────────────
 
