@@ -126,10 +126,16 @@ def speculative_transcribe(
         while len(tokens) - n_init < max_new_tokens:
             pos = len(tokens)  # self-attn cache length after last accepted token
 
-            # ── DRAFT PHASE: propose spec_window tokens ───────────────────────
+            # Cap window so offset + len(v_inp) never exceeds n_text_ctx.
+            # v_inp = [last_token] + proposals, so max proposals = n_text_ctx - pos - 1.
+            effective_window = min(spec_window, target.dims.n_text_ctx - pos - 1)
+            if effective_window <= 0:
+                break
+
+            # ── DRAFT PHASE: propose effective_window tokens ──────────────────
             proposals: List[int] = []
             d_inp = torch.tensor([[tokens[-1]]], device=d_dev, dtype=torch.long)
-            for _ in range(spec_window):
+            for _ in range(effective_window):
                 d_log = draft.decoder(d_inp, d_feat, kv_cache=d_cache)
                 tok = int(d_log[0, -1].argmax())
                 proposals.append(tok)
