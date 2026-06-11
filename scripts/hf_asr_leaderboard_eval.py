@@ -94,18 +94,31 @@ def main():
                         choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument("--draft-model", default=None,
+                        help="Enable speculative decoding with this draft model (e.g. 'tiny'). Forces greedy decoding (beam_size=1).")
     parser.add_argument("--language", default="en")
     parser.add_argument("--output", default="artemis_results.json")
     args = parser.parse_args()
+
+    use_speculative = args.draft_model is not None
+    if use_speculative:
+        args.beam_size = 1  # speculative decoding is greedy by design
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
     print(f"Device    : {gpu_name}")
     print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size})")
+    if use_speculative:
+        print(f"Draft     : {args.draft_model}  (speculative decoding)")
     print(f"Dataset   : {args.dataset}")
     print()
 
     model = whisper.load_model(args.model)
+    if use_speculative:
+        from whisper.speculative import speculative_transcribe
+        draft_model = whisper.load_model(args.draft_model)
+        print(f"Draft model loaded: {args.draft_model}")
+
     if args.use_compile and torch.cuda.is_available():
         print("Compiling encoder with torch.compile (reduce-overhead) …")
         try:
@@ -189,12 +202,19 @@ def main():
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
 
-                result = model.transcribe(
-                    audio_array,
-                    language=args.language,
-                    beam_size=args.beam_size,
-                    fp16=(args.compute_type == "float16"),
-                )
+                if use_speculative:
+                    result = speculative_transcribe(
+                        model, draft_model, audio_array,
+                        language=args.language,
+                        fp16=(args.compute_type == "float16"),
+                    )
+                else:
+                    result = model.transcribe(
+                        audio_array,
+                        language=args.language,
+                        beam_size=args.beam_size,
+                        fp16=(args.compute_type == "float16"),
+                    )
 
                 if device == "cuda":
                     torch.cuda.synchronize()

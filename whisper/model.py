@@ -364,15 +364,23 @@ class Whisper(nn.Module):
             else:
                 current = cache[module]
                 b, t, d = current.shape[0], self.dims.n_text_ctx, current.shape[2]
-                # data_ptr() equality means cache still points into our buffer
-                # (beam reordering replaces it with a new tensor at a different address)
-                if module not in _buf or current.data_ptr() != _buf[module].data_ptr():
-                    if module not in _buf or _buf[module].shape != (b, self.dims.n_text_ctx, d):
-                        _buf[module] = torch.empty(b, self.dims.n_text_ctx, d,
-                                                   dtype=output.dtype, device=output.device)
-                    _buf[module][:, :current.shape[1]].copy_(current)
+                same_buf = module in _buf and current.data_ptr() == _buf[module].data_ptr()
+                if same_buf and current.shape[1] == _pos.get(module, -1):
+                    # Normal incremental path — buffer is current, position is known
+                    pos = _pos[module]
+                else:
+                    # Three cases land here:
+                    #  a) first incremental write (module not in _buf)
+                    #  b) beam reorder replaced tensor (different data_ptr)
+                    #  c) external truncation via _truncate_kv (same data_ptr, shorter shape)
+                    # For (c) data is already in the buffer — skip the copy.
+                    if not same_buf:
+                        if module not in _buf or _buf[module].shape != (b, self.dims.n_text_ctx, d):
+                            _buf[module] = torch.empty(b, self.dims.n_text_ctx, d,
+                                                       dtype=output.dtype, device=output.device)
+                        _buf[module][:, :current.shape[1]].copy_(current)
                     _pos[module] = current.shape[1]
-                pos = _pos[module]
+                    pos = current.shape[1]
                 n = output.shape[1]
                 _buf[module][:, pos:pos + n].copy_(output)
                 _pos[module] = pos + n
