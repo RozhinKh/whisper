@@ -354,13 +354,29 @@ class Whisper(nn.Module):
         """
         cache = {**cache} if cache is not None else {}
         hooks = []
+        _buf: dict = {}  # pre-allocated (batch, n_text_ctx, head_dim) tensors
+        _pos: dict = {}  # current write position in each buffer
 
         def save_to_cache(module, _, output):
             if module not in cache or output.shape[1] > self.dims.n_text_ctx:
-                # save as-is, for the first token or cross attention
+                # cross-attention or very first self-attention token — store as-is
                 cache[module] = output
             else:
-                cache[module] = torch.cat([cache[module], output], dim=1).detach()
+                current = cache[module]
+                b, t, d = current.shape[0], self.dims.n_text_ctx, current.shape[2]
+                # data_ptr() equality means cache still points into our buffer
+                # (beam reordering replaces it with a new tensor at a different address)
+                if module not in _buf or current.data_ptr() != _buf[module].data_ptr():
+                    if module not in _buf or _buf[module].shape != (b, self.dims.n_text_ctx, d):
+                        _buf[module] = torch.empty(b, self.dims.n_text_ctx, d,
+                                                   dtype=output.dtype, device=output.device)
+                    _buf[module][:, :current.shape[1]].copy_(current)
+                    _pos[module] = current.shape[1]
+                pos = _pos[module]
+                n = output.shape[1]
+                _buf[module][:, pos:pos + n].copy_(output)
+                _pos[module] = pos + n
+                cache[module] = _buf[module][:, :_pos[module]]
             return cache[module]
 
         def install_hooks(layer: nn.Module):
