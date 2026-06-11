@@ -104,13 +104,6 @@ def main():
     print()
 
     model = whisper.load_model(args.model)
-    if args.use_compile and torch.cuda.is_available():
-        print("Compiling encoder with torch.compile (reduce-overhead) …")
-        try:
-            model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
-            print("Encoder compiled.")
-        except Exception as e:
-            print(f"torch.compile failed ({e}); running without compilation.")
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]
