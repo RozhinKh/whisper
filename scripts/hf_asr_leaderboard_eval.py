@@ -86,6 +86,8 @@ def main():
                         choices=list(DATASET_CONFIGS.keys()))
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Cap number of samples (None = full dataset)")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="Take every Nth sample (e.g. 13 gives ~200 representative samples from the full 2620)")
     parser.add_argument("--concat-duration", type=float, default=None,
                         help="Concatenate samples into one audio of this length (seconds) and transcribe as a single file")
     parser.add_argument("--compute-type", default="float16",
@@ -167,9 +169,14 @@ def main():
         n = 1
         print(f"RTF={rtf(duration_s, elapsed):.4f}  elapsed={elapsed:.1f}s")
     else:
+        sample_idx = 0
         for sample in dataset:
             if args.max_samples and n >= args.max_samples:
                 break
+            if sample_idx % args.stride != 0:
+                sample_idx += 1
+                continue
+            sample_idx += 1
 
             audio_array = np.array(sample[cfg["audio_col"]]["array"], dtype=np.float32)
             sampling_rate = sample[cfg["audio_col"]]["sampling_rate"]
