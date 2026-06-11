@@ -19,7 +19,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from .audio import log_mel_spectrogram, pad_or_trim, N_SAMPLES
+from .audio import log_mel_spectrogram, pad_or_trim, N_SAMPLES, N_FRAMES
 from .tokenizer import get_tokenizer
 
 _SPEC_WINDOW = 5
@@ -28,7 +28,7 @@ _SPEC_WINDOW = 5
 def _to_mel(audio: np.ndarray, n_mels: int, device, dtype) -> torch.Tensor:
     t = torch.from_numpy(audio).float()
     mel = log_mel_spectrogram(t, n_mels=n_mels, padding=N_SAMPLES)
-    mel = pad_or_trim(mel, axis=-1)
+    mel = pad_or_trim(mel, N_FRAMES, axis=-1)  # trim to exactly 3000 mel frames
     return mel.unsqueeze(0).to(device=device, dtype=dtype)
 
 
