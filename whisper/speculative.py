@@ -123,6 +123,14 @@ def speculative_transcribe(
             d_feat, kv_cache=d_cache,
         )
 
+        # Sanity: target prediction after full init with NO KV cache.
+        # This shows what the model "wants" to generate given the audio.
+        _sanity = target.decoder(
+            torch.tensor([init], device=t_dev, dtype=torch.long), t_feat
+        )
+        _sanity_top5 = _sanity[0, -1].topk(5)
+        print(f"DEBUG SANITY no-cache: top5 tokens={_sanity_top5.indices.tolist()} values={_sanity_top5.values.tolist()}")
+
         tokens: List[int] = list(init)
         _dbg_round = 0
 
@@ -164,9 +172,12 @@ def speculative_transcribe(
             v_inp = torch.tensor(
                 [[tokens[-1]] + proposals], device=t_dev, dtype=torch.long
             )
+            _t_offset = next(iter(t_cache.values())).shape[1] if t_cache else 0
             t_log = target.decoder(v_inp, t_feat, kv_cache=t_cache)
             # target cache now at pos+k; draft cache at pos+k-1
             # t_log[0, i] predicts the token at position (pos + i)
+            if _dbg_round <= 3:
+                print(f"DEBUG   t_cache_offset_before={_t_offset} v_inp_len={v_inp.shape[1]}")
 
             # ── ACCEPT / REJECT ───────────────────────────────────────────────
             _dbg_round += 1
