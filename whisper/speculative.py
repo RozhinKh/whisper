@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from .audio import log_mel_spectrogram, pad_or_trim, N_SAMPLES, N_FRAMES
+from .model import MultiHeadAttention
 from .tokenizer import get_tokenizer
 
 _SPEC_WINDOW = 5
@@ -28,20 +29,46 @@ _SPEC_WINDOW = 5
 def _to_mel(audio: np.ndarray, n_mels: int, device, dtype) -> torch.Tensor:
     t = torch.from_numpy(audio).float()
     mel = log_mel_spectrogram(t, n_mels=n_mels, padding=N_SAMPLES)
-    mel = pad_or_trim(mel, N_FRAMES, axis=-1)  # trim to exactly 3000 mel frames
+    mel = pad_or_trim(mel, N_FRAMES, axis=-1)
     return mel.unsqueeze(0).to(device=device, dtype=dtype)
+
+
+def _install_kv_hooks(model) -> tuple:
+    """Simple KV cache using torch.cat.
+
+    Unlike install_kv_cache_hooks (which uses a pre-allocated buffer with
+    _pos/_buf tracking), this avoids all stateful position bookkeeping.
+    Truncation via _truncate_kv works correctly: the next torch.cat uses the
+    truncated slice as its left operand and creates a fresh correctly-shaped
+    tensor.
+    """
+    cache: dict = {}
+    hooks: list = []
+    n_text_ctx = model.dims.n_text_ctx
+
+    def save_to_cache(module, _, output):
+        if module not in cache or output.shape[1] > n_text_ctx:
+            cache[module] = output.detach()
+        else:
+            cache[module] = torch.cat([cache[module], output.detach()], dim=1)
+        return cache[module]
+
+    for layer in model.decoder.modules():
+        if isinstance(layer, MultiHeadAttention):
+            hooks.append(layer.key.register_forward_hook(save_to_cache))
+            hooks.append(layer.value.register_forward_hook(save_to_cache))
+
+    return cache, hooks
 
 
 def _truncate_kv(cache: dict, n_audio_ctx: int, length: int) -> None:
     """Truncate self-attention KV caches to `length` timesteps in-place.
     Cross-attention entries (shape[1] == n_audio_ctx) are left untouched.
-    The pre-allocated-buffer hook detects the position mismatch on the next
-    call and skips the redundant copy (data is already in the buffer).
     """
     for mod in cache:
         t = cache[mod]
         if t.shape[1] == n_audio_ctx:
-            continue  # cross-attention — fixed size, never truncate
+            continue
         if t.shape[1] > length:
             cache[mod] = t[:, :length].detach()
 
@@ -80,7 +107,6 @@ def speculative_transcribe(
     dict with key "text" — same shape as model.transcribe() output.
     """
     if len(audio) > N_SAMPLES:
-        # Long-form audio: fall back to standard greedy transcription
         return target.transcribe(audio, language=language, fp16=fp16, beam_size=1)
 
     dtype = torch.float16 if fp16 else torch.float32
@@ -88,8 +114,6 @@ def speculative_transcribe(
     d_dev = draft.device
     n_audio_ctx = target.dims.n_audio_ctx  # 1500 for all Whisper models
 
-    # Both models share the same mel frame count but may differ in n_mels
-    # (tiny/small/medium: 80, large-v3: 128)
     t_mel = _to_mel(audio, target.dims.n_mels, t_dev, dtype)
     d_mel = _to_mel(audio, draft.dims.n_mels, d_dev, dtype)
 
@@ -107,13 +131,18 @@ def speculative_transcribe(
     eot = tokenizer.eot
     n_init = len(init)
 
-    t_cache, t_hooks = target.install_kv_cache_hooks()
-    d_cache, d_hooks = draft.install_kv_cache_hooks()
+    # Install our own simple KV hooks (torch.cat based — no _buf/_pos state).
+    # IMPORTANT: hooks are installed *after* embed_audio so the encoder is not
+    # affected, and the sanity check below runs *before* hooks so it cannot
+    # accidentally write into the cache.
+    t_cache, t_hooks = _install_kv_hooks(target)
+    d_cache, d_hooks = _install_kv_hooks(draft)
 
     with torch.no_grad():
-        # Prime both KV caches with init[:-1].  tokens[-1] (the last init
-        # token) is fed as the first input each round so the models see the
-        # correct absolute position for every proposal.
+        # Prime both KV caches with init[:-1].
+        # Invariant maintained throughout the loop:
+        #   caches are at position len(tokens)-1 at the start of every round.
+        # tokens[-1] is therefore the "pending" token not yet in the cache.
         target.decoder(
             torch.tensor([init[:-1]], device=t_dev, dtype=torch.long),
             t_feat, kv_cache=t_cache,
@@ -123,30 +152,21 @@ def speculative_transcribe(
             d_feat, kv_cache=d_cache,
         )
 
-        # Sanity: target prediction after full init with NO KV cache.
-        # This shows what the model "wants" to generate given the audio.
-        _sanity = target.decoder(
-            torch.tensor([init], device=t_dev, dtype=torch.long), t_feat
-        )
-        _sanity_top5 = _sanity[0, -1].topk(5)
-        print(f"DEBUG SANITY no-cache: top5 tokens={_sanity_top5.indices.tolist()} values={_sanity_top5.values.tolist()}")
-
         tokens: List[int] = list(init)
-        _dbg_round = 0
 
         while len(tokens) - n_init < max_new_tokens:
             pos = len(tokens)  # = n_init + accepted so far
 
-            # Round 1: cache at pos-1 (primed with init[:-1]); rounds 2+: cache
-            # at pos (after truncate/sync).  Worst case offset is pos, so
-            # pos + 1 + ew must not exceed n_text_ctx.
+            # Cap proposals so v_inp never exceeds positional embedding range.
             effective_window = min(spec_window, target.dims.n_text_ctx - pos - 1)
             if effective_window <= 0:
                 break
 
-            # ── DRAFT PHASE: propose effective_window tokens ──────────────────
-            # Draft cache starts at pos-1; feeding tokens[-1] advances it to pos,
+            # ── DRAFT PHASE ───────────────────────────────────────────────────
+            # Cache starts at pos-1; feeding tokens[-1] advances it to pos,
             # then each proposal advances it one more step.
+            # After the loop: draft cache at pos-1+k = pos+k-1
+            # (proposals[-1] was generated but NOT fed back into draft).
             proposals: List[int] = []
             d_inp = torch.tensor([[tokens[-1]]], device=d_dev, dtype=torch.long)
             for _ in range(effective_window):
@@ -160,27 +180,17 @@ def speculative_transcribe(
             if not proposals:
                 break
             k = len(proposals)
-            # After the draft loop:
-            #   draft fed [tokens[-1], p0, ..., p_{k-2}] → k calls → cache at pos-1+k = pos+k-1
-            #   (proposals[-1] was generated but NOT fed back)
-            # After the target verification pass (v_inp has k+1 tokens):
-            #   target cache at pos-1+(k+1) = pos+k
-            # Invariant we maintain: caches at len(tokens)-1 before each round.
 
-            # ── VERIFICATION PHASE: target scores all proposals in one pass ──
-            # v_inp = [tokens[-1], p0, ..., p_{k-1}]; target cache starts at pos-1.
+            # ── VERIFICATION PHASE ────────────────────────────────────────────
+            # v_inp = [tokens[-1], p0, …, p_{k-1}]  (k+1 tokens)
+            # Target cache starts at pos-1 → after this call: pos+k.
+            # t_log[0, i] = target's prediction for absolute position (pos + i).
             v_inp = torch.tensor(
                 [[tokens[-1]] + proposals], device=t_dev, dtype=torch.long
             )
-            _t_offset = next(iter(t_cache.values())).shape[1] if t_cache else 0
             t_log = target.decoder(v_inp, t_feat, kv_cache=t_cache)
-            # target cache now at pos+k; draft cache at pos+k-1
-            # t_log[0, i] predicts the token at position (pos + i)
-            if _dbg_round <= 3:
-                print(f"DEBUG   t_cache_offset_before={_t_offset} v_inp_len={v_inp.shape[1]}")
 
             # ── ACCEPT / REJECT ───────────────────────────────────────────────
-            _dbg_round += 1
             n_acc = 0
             correction: Optional[int] = None
             target_preds = [int(t_log[0, i].argmax()) for i in range(k)]
@@ -193,26 +203,24 @@ def speculative_transcribe(
                 else:
                     correction = tp
                     break
-            if _dbg_round <= 3:
-                print(f"DEBUG round={_dbg_round} pos={pos} proposals={proposals} target={target_preds} n_acc={n_acc} corr={correction}")
 
             tokens.extend(proposals[:n_acc])
             if tokens[-1] == eot:
                 break
 
             if correction is None:
-                # All k draft tokens accepted — claim the free bonus token.
+                # All k draft tokens accepted — take one free bonus token.
+                # Target cache at pos+k = len(tokens)-1+1 (need one more step).
                 bonus = int(t_log[0, n_acc].argmax())
                 tokens.append(bonus)
                 if bonus == eot:
                     break
-                # Target at pos+k = len(tokens)-1 ✓
-                # Draft at pos+k-1; feed proposals[-1] (position pos+k-1) to reach pos+k.
+                # Draft at pos+k-1; feed proposals[-1] (position pos+k-1) to sync.
                 draft.decoder(
                     torch.tensor([[proposals[-1]]], device=d_dev, dtype=torch.long),
                     d_feat, kv_cache=d_cache,
                 )
-                # Both caches now at pos+k = len(tokens)-1 ✓
+                # Both caches now at pos+k = len(tokens)-1. ✓
             else:
                 tokens.append(correction)
                 if correction == eot:
@@ -220,18 +228,15 @@ def speculative_transcribe(
 
                 want = len(tokens)  # = pos + n_acc + 1
 
-                # Target at pos+k, draft at pos+k-1.  Truncate both to want-1 = pos+n_acc.
-                # This removes the rejected proposal (and any overshoot) from both caches.
-                # correction is now tokens[-1] and will be fed as the first token next round.
+                # Target at pos+k, draft at pos+k-1.
+                # Truncate both to want-1 = pos+n_acc so correction = tokens[-1]
+                # becomes the "pending" token fed as input next round.
                 _truncate_kv(t_cache, n_audio_ctx, want - 1)
                 _truncate_kv(d_cache, n_audio_ctx, want - 1)
-                # Both caches now at want-1 = len(tokens)-1 ✓
+                # Both caches now at want-1 = len(tokens)-1. ✓
 
     for h in t_hooks + d_hooks:
         h.remove()
 
-    generated = tokens[n_init:]
-    print(f"DEBUG n_rounds={len(tokens)-n_init} generated[:10]={generated[:10]} eot={eot}")
-    text = tokenizer.decode([t for t in generated if t < eot]).strip()
-    print(f"DEBUG text={repr(text[:80])}")
+    text = tokenizer.decode([t for t in tokens[n_init:] if t < eot]).strip()
     return {"text": text}
