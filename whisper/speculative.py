@@ -111,28 +111,34 @@ def speculative_transcribe(
     d_cache, d_hooks = draft.install_kv_cache_hooks()
 
     with torch.no_grad():
-        # Prime both KV caches with the initial token sequence
+        # Prime both KV caches with init[:-1].  tokens[-1] (the last init
+        # token) is fed as the first input each round so the models see the
+        # correct absolute position for every proposal.
         target.decoder(
-            torch.tensor([init], device=t_dev, dtype=torch.long),
+            torch.tensor([init[:-1]], device=t_dev, dtype=torch.long),
             t_feat, kv_cache=t_cache,
         )
         draft.decoder(
-            torch.tensor([init], device=d_dev, dtype=torch.long),
+            torch.tensor([init[:-1]], device=d_dev, dtype=torch.long),
             d_feat, kv_cache=d_cache,
         )
 
         tokens: List[int] = list(init)
 
         while len(tokens) - n_init < max_new_tokens:
-            pos = len(tokens)  # self-attn cache length after last accepted token
+            pos = len(tokens)  # = n_init + accepted so far
 
-            # Cap window so offset + len(v_inp) never exceeds n_text_ctx.
-            # v_inp = [last_token] + proposals, so max proposals = n_text_ctx - pos - 1.
-            effective_window = min(spec_window, target.dims.n_text_ctx - pos - 1)
+            # After priming n_init-1 tokens, each round starts with caches at
+            # pos-1 and feeds [tokens[-1]] + proposals.  The last valid cache
+            # slot after verification is pos-1 + 1 + ew = pos + ew, which must
+            # stay below n_text_ctx.
+            effective_window = min(spec_window, target.dims.n_text_ctx - pos)
             if effective_window <= 0:
                 break
 
             # ── DRAFT PHASE: propose effective_window tokens ──────────────────
+            # Draft cache starts at pos-1; feeding tokens[-1] advances it to pos,
+            # then each proposal advances it one more step.
             proposals: List[int] = []
             d_inp = torch.tensor([[tokens[-1]]], device=d_dev, dtype=torch.long)
             for _ in range(effective_window):
@@ -148,12 +154,13 @@ def speculative_transcribe(
             # draft cache is now at: pos + len(proposals)
 
             # ── VERIFICATION PHASE: target scores all proposals in one pass ──
+            # v_inp = [tokens[-1], p0, ..., p_{k-1}]; target cache starts at pos-1.
             v_inp = torch.tensor(
                 [[tokens[-1]] + proposals], device=t_dev, dtype=torch.long
             )
             t_log = target.decoder(v_inp, t_feat, kv_cache=t_cache)
-            # target cache is now at: pos + len(proposals) + 1
-            # t_log[0, i] predicts the token at position (pos + i + 1)
+            # target cache is now at: pos + len(proposals)
+            # t_log[0, i] predicts the token at position (pos + i)
 
             # ── ACCEPT / REJECT ───────────────────────────────────────────────
             n_acc = 0
@@ -191,11 +198,9 @@ def speculative_transcribe(
 
                 want = len(tokens)  # = pos + n_acc + 1
 
-                # Target cache at pos + len(proposals) + 1 → truncate to want
+                # Both caches at pos + len(proposals) → truncate target to want,
+                # draft to want-1, then step correction to bring draft to want.
                 _truncate_kv(t_cache, n_audio_ctx, want)
-
-                # Draft cache at pos + len(proposals) → truncate to pos + n_acc,
-                # then step with the correction token to reach want
                 _truncate_kv(d_cache, n_audio_ctx, want - 1)
                 draft.decoder(
                     torch.tensor([[correction]], device=d_dev, dtype=torch.long),
