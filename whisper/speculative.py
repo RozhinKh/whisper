@@ -124,6 +124,7 @@ def speculative_transcribe(
         )
 
         tokens: List[int] = list(init)
+        _dbg_round = 0
 
         while len(tokens) - n_init < max_new_tokens:
             pos = len(tokens)  # = n_init + accepted so far
@@ -168,10 +169,12 @@ def speculative_transcribe(
             # t_log[0, i] predicts the token at position (pos + i)
 
             # ── ACCEPT / REJECT ───────────────────────────────────────────────
+            _dbg_round += 1
             n_acc = 0
             correction: Optional[int] = None
+            target_preds = [int(t_log[0, i].argmax()) for i in range(k)]
             for i, dp in enumerate(proposals):
-                tp = int(t_log[0, i].argmax())
+                tp = target_preds[i]
                 if tp == dp:
                     n_acc += 1
                     if dp == eot:
@@ -179,6 +182,8 @@ def speculative_transcribe(
                 else:
                     correction = tp
                     break
+            if _dbg_round <= 3:
+                print(f"DEBUG round={_dbg_round} pos={pos} proposals={proposals} target={target_preds} n_acc={n_acc} corr={correction}")
 
             tokens.extend(proposals[:n_acc])
             if tokens[-1] == eot:
@@ -214,5 +219,8 @@ def speculative_transcribe(
     for h in t_hooks + d_hooks:
         h.remove()
 
-    text = tokenizer.decode([t for t in tokens[n_init:] if t < eot]).strip()
+    generated = tokens[n_init:]
+    print(f"DEBUG n_rounds={len(tokens)-n_init} generated[:10]={generated[:10]} eot={eot}")
+    text = tokenizer.decode([t for t in generated if t < eot]).strip()
+    print(f"DEBUG text={repr(text[:80])}")
     return {"text": text}
