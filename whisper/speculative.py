@@ -150,7 +150,13 @@ def speculative_transcribe(
 
             if not proposals:
                 break
-            # draft cache is now at: pos + len(proposals)
+            k = len(proposals)
+            # After the draft loop:
+            #   draft fed [tokens[-1], p0, ..., p_{k-2}] → k calls → cache at pos-1+k = pos+k-1
+            #   (proposals[-1] was generated but NOT fed back)
+            # After the target verification pass (v_inp has k+1 tokens):
+            #   target cache at pos-1+(k+1) = pos+k
+            # Invariant we maintain: caches at len(tokens)-1 before each round.
 
             # ── VERIFICATION PHASE: target scores all proposals in one pass ──
             # v_inp = [tokens[-1], p0, ..., p_{k-1}]; target cache starts at pos-1.
@@ -158,7 +164,7 @@ def speculative_transcribe(
                 [[tokens[-1]] + proposals], device=t_dev, dtype=torch.long
             )
             t_log = target.decoder(v_inp, t_feat, kv_cache=t_cache)
-            # target cache is now at: pos + len(proposals)
+            # target cache now at pos+k; draft cache at pos+k-1
             # t_log[0, i] predicts the token at position (pos + i)
 
             # ── ACCEPT / REJECT ───────────────────────────────────────────────
@@ -179,17 +185,18 @@ def speculative_transcribe(
                 break
 
             if correction is None:
-                # All draft tokens accepted — claim the free bonus token
+                # All k draft tokens accepted — claim the free bonus token.
                 bonus = int(t_log[0, n_acc].argmax())
                 tokens.append(bonus)
                 if bonus == eot:
                     break
-                # Advance draft cache by 1 to stay in sync with target
+                # Target at pos+k = len(tokens)-1 ✓
+                # Draft at pos+k-1; feed proposals[-1] (position pos+k-1) to reach pos+k.
                 draft.decoder(
-                    torch.tensor([[bonus]], device=d_dev, dtype=torch.long),
+                    torch.tensor([[proposals[-1]]], device=d_dev, dtype=torch.long),
                     d_feat, kv_cache=d_cache,
                 )
-                # Both caches now at pos + n_acc + 1 = len(tokens) ✓
+                # Both caches now at pos+k = len(tokens)-1 ✓
             else:
                 tokens.append(correction)
                 if correction == eot:
@@ -197,15 +204,12 @@ def speculative_transcribe(
 
                 want = len(tokens)  # = pos + n_acc + 1
 
-                # Both caches at pos + len(proposals) → truncate target to want,
-                # draft to want-1, then step correction to bring draft to want.
-                _truncate_kv(t_cache, n_audio_ctx, want)
+                # Target at pos+k, draft at pos+k-1.  Truncate both to want-1 = pos+n_acc.
+                # This removes the rejected proposal (and any overshoot) from both caches.
+                # correction is now tokens[-1] and will be fed as the first token next round.
+                _truncate_kv(t_cache, n_audio_ctx, want - 1)
                 _truncate_kv(d_cache, n_audio_ctx, want - 1)
-                draft.decoder(
-                    torch.tensor([[correction]], device=d_dev, dtype=torch.long),
-                    d_feat, kv_cache=d_cache,
-                )
-                # Both caches now at want = len(tokens) ✓
+                # Both caches now at want-1 = len(tokens)-1 ✓
 
     for h in t_hooks + d_hooks:
         h.remove()
