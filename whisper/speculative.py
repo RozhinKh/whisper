@@ -128,11 +128,10 @@ def speculative_transcribe(
         while len(tokens) - n_init < max_new_tokens:
             pos = len(tokens)  # = n_init + accepted so far
 
-            # After priming n_init-1 tokens, each round starts with caches at
-            # pos-1 and feeds [tokens[-1]] + proposals.  The last valid cache
-            # slot after verification is pos-1 + 1 + ew = pos + ew, which must
-            # stay below n_text_ctx.
-            effective_window = min(spec_window, target.dims.n_text_ctx - pos)
+            # Round 1: cache at pos-1 (primed with init[:-1]); rounds 2+: cache
+            # at pos (after truncate/sync).  Worst case offset is pos, so
+            # pos + 1 + ew must not exceed n_text_ctx.
+            effective_window = min(spec_window, target.dims.n_text_ctx - pos - 1)
             if effective_window <= 0:
                 break
 
