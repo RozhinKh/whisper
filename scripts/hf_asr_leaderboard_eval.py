@@ -126,24 +126,27 @@ def main():
 
     if args.use_compile and torch.cuda.is_available():
         import os
-        # Single-threaded compilation avoids inductor subprocess pool crashes on
-        # memory-limited machines. cudagraphs backend is more stable than inductor
-        # for inference-only use and works well with fixed encoder shape [1,128,3000].
-        os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+        # Single thread avoids inductor subprocess pool OOM crashes.
+        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
         print("Compiling with torch.compile …")
-        for name, mod in [("encoder", model.encoder), ("decoder", model.decoder)]:
-            for backend in ("cudagraphs", "eager"):
-                try:
-                    compiled = torch.compile(mod, backend=backend, dynamic=True)
-                    # Assign back
-                    if name == "encoder":
-                        model.encoder = compiled
-                    else:
-                        model.decoder = compiled
-                    print(f"  {name.capitalize()} compiled (backend={backend}).")
-                    break
-                except Exception as e:
-                    print(f"  {name.capitalize()} compile failed with {backend}: {e}")
+
+        # Encoder: cudagraphs — input is always [1, n_mels, 3000] (fixed shape).
+        # Captures the CUDA graph once on first call, replays it every subsequent call.
+        try:
+            model.encoder = torch.compile(model.encoder, backend="cudagraphs")
+            print("  Encoder compiled (cudagraphs — fixed shape).")
+        except Exception as e:
+            print(f"  Encoder compile failed: {e}")
+
+        # Decoder: inductor with dynamic=True — handles growing KV-cache length.
+        # cudagraphs would crash here because KV-cache shape changes every token step.
+        try:
+            model.decoder = torch.compile(
+                model.decoder, mode="reduce-overhead", dynamic=True
+            )
+            print("  Decoder compiled (inductor — dynamic shapes).")
+        except Exception as e:
+            print(f"  Decoder compile failed: {e}")
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]
