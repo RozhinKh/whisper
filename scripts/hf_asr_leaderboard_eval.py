@@ -125,12 +125,18 @@ def main():
         print(f"Draft model loaded: {args.draft_model}")
 
     if args.use_compile and torch.cuda.is_available():
-        print("Compiling encoder with torch.compile (reduce-overhead) …")
+        print("Compiling with torch.compile (reduce-overhead) …")
         try:
             model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
-            print("Encoder compiled.")
+            print("  Encoder compiled.")
         except Exception as e:
-            print(f"torch.compile failed ({e}); running without compilation.")
+            print(f"  Encoder compile failed ({e})")
+        try:
+            # dynamic=True handles variable KV-cache length across decoding steps
+            model.decoder = torch.compile(model.decoder, mode="reduce-overhead", dynamic=True)
+            print("  Decoder compiled.")
+        except Exception as e:
+            print(f"  Decoder compile failed ({e}); decoder runs uncompiled.")
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]
