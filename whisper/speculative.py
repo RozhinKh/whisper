@@ -121,6 +121,7 @@ def speculative_transcribe(
         t_feat = target.embed_audio(t_mel)
         d_feat = draft.embed_audio(d_mel)
 
+    # Target tokenizer: governs the output token sequence and suppress masks.
     tokenizer = get_tokenizer(
         multilingual=target.is_multilingual,
         num_languages=target.num_languages,
@@ -130,6 +131,18 @@ def speculative_transcribe(
     init = list(tokenizer.sot_sequence_including_notimestamps)
     eot = tokenizer.eot
     n_init = len(init)
+
+    # Draft tokenizer: used ONLY to prime the draft KV cache with the correct
+    # special token IDs. tiny/base (99 languages) have different IDs for
+    # <|transcribe|> and <|notimestamps|> than large-v3 (100 languages), so
+    # feeding target's init tokens directly would mis-condition the draft.
+    d_tokenizer = get_tokenizer(
+        multilingual=draft.is_multilingual,
+        num_languages=draft.num_languages,
+        language=language,
+        task="transcribe",
+    )
+    d_init = list(d_tokenizer.sot_sequence_including_notimestamps)
 
     # Replicate Whisper's SuppressTokens + ApplyTimestampRules (no-timestamps mode).
     # model.transcribe() applies these via LogitFilter; raw argmax without them
@@ -173,11 +186,14 @@ def speculative_transcribe(
             t_feat, kv_cache=t_cache,
         )
         draft.decoder(
-            torch.tensor([init[:-1]], device=d_dev, dtype=torch.long),
+            torch.tensor([d_init[:-1]], device=d_dev, dtype=torch.long),
             d_feat, kv_cache=d_cache,
         )
 
         tokens: List[int] = list(init)
+        # Draft sees its own special tokens in round 0; text tokens (0..50256)
+        # are identical between all Whisper models so no mapping needed after that.
+        d_pending: Optional[int] = d_init[-1]  # draft's no_timestamps
 
         while len(tokens) - n_init < max_new_tokens:
             pos = len(tokens)  # = n_init + accepted so far
@@ -193,7 +209,9 @@ def speculative_transcribe(
             # After the loop: draft cache at pos-1+k = pos+k-1
             # (proposals[-1] was generated but NOT fed back into draft).
             proposals: List[int] = []
-            d_inp = torch.tensor([[tokens[-1]]], device=d_dev, dtype=torch.long)
+            _d_tok = d_pending if d_pending is not None else tokens[-1]
+            d_pending = None
+            d_inp = torch.tensor([[_d_tok]], device=d_dev, dtype=torch.long)
             for _ in range(effective_window):
                 d_log = draft.decoder(d_inp, d_feat, kv_cache=d_cache)
                 tok = _argmax_d(d_log[0, -1])
