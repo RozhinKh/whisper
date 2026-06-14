@@ -93,6 +93,9 @@ def main():
     parser.add_argument("--compute-type", default="float16",
                         choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Decoding temperature. 0.0 = greedy with no fallback (default). "
+                             "Whisper default uses [0.0,0.2,...,1.0] fallback ladder.")
     parser.add_argument("--use-compile", action="store_true")
     parser.add_argument("--draft-model", default=None,
                         help="Enable speculative decoding with this draft model (e.g. 'tiny').")
@@ -105,7 +108,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
     print(f"Device    : {gpu_name}")
-    print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size})")
+    print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size}  temp={args.temperature})")
     if use_speculative:
         print(f"Draft     : {args.draft_model}  (speculative decoding)")
     print(f"Dataset   : {args.dataset}")
@@ -166,6 +169,7 @@ def main():
                 audio_array,
                 language=args.language,
                 beam_size=args.beam_size,
+                temperature=args.temperature,
                 fp16=(args.compute_type == "float16"),
             )
             if device == "cuda":
@@ -211,6 +215,7 @@ def main():
                         audio_array,
                         language=args.language,
                         beam_size=args.beam_size,
+                        temperature=args.temperature,
                         fp16=(args.compute_type == "float16"),
                     )
 
