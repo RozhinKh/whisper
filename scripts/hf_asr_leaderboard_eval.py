@@ -95,14 +95,12 @@ def main():
     parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument("--use-compile", action="store_true")
     parser.add_argument("--draft-model", default=None,
-                        help="Enable speculative decoding with this draft model (e.g. 'tiny'). Forces greedy decoding (beam_size=1).")
+                        help="Enable speculative decoding with this draft model (e.g. 'tiny').")
     parser.add_argument("--language", default="en")
     parser.add_argument("--output", default="artemis_results.json")
     args = parser.parse_args()
 
     use_speculative = args.draft_model is not None
-    if use_speculative:
-        args.beam_size = 1  # speculative decoding is greedy by design
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
