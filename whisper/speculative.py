@@ -131,15 +131,6 @@ def speculative_transcribe(
     eot = tokenizer.eot
     n_init = len(init)
 
-    # Diagnostic: run BEFORE hooks so it cannot contaminate any cache.
-    # Tells us if the model+audio-features pipeline is fundamentally correct.
-    with torch.no_grad():
-        _diag = target.decoder(
-            torch.tensor([init], device=t_dev, dtype=torch.long), t_feat
-        )
-        print(f"DIAG init={init} clean_pred_after_full_init={int(_diag[0, -1].argmax())}")
-        del _diag
-
     # Install our own simple KV hooks (torch.cat based — no _buf/_pos state).
     t_cache, t_hooks = _install_kv_hooks(target)
     d_cache, d_hooks = _install_kv_hooks(draft)
@@ -190,9 +181,6 @@ def speculative_transcribe(
             # ── VERIFICATION PHASE ────────────────────────────────────────────
             # v_inp = [tokens[-1], p0, …, p_{k-1}]  (k+1 tokens)
             # Target cache starts at pos-1 → after this call: pos+k.
-            if pos == n_init:
-                _off = next(iter(t_cache.values())).shape[1] if t_cache else -1
-                print(f"DIAG round1 t_cache_offset={_off} expected={n_init - 1}")
             # t_log[0, i] = target's prediction for absolute position (pos + i).
             v_inp = torch.tensor(
                 [[tokens[-1]] + proposals], device=t_dev, dtype=torch.long
