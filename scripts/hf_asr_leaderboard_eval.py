@@ -96,7 +96,13 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Decoding temperature. 0.0 = greedy with no fallback (default). "
                              "Whisper default uses [0.0,0.2,...,1.0] fallback ladder.")
-    parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument("--use-compile", action="store_true",
+                        help="Compile the encoder with cudagraphs (static shape, ~4%% speedup).")
+    parser.add_argument("--compile-decoder", action="store_true",
+                        help="Compile the target decoder with torch.compile(dynamic=True). "
+                             "Eliminates Python overhead across all 32 decoder layers. "
+                             "Requires the hook-free KV cache (used automatically by "
+                             "speculative_transcribe). First sample triggers compilation warmup.")
     parser.add_argument("--draft-model", default=None,
                         help="Enable speculative decoding with this draft model (e.g. 'tiny').")
     parser.add_argument("--spec-window", type=int, default=5,
@@ -129,13 +135,30 @@ def main():
         # Encoder input is always [1, n_mels, 3000] — fixed shape.
         # cudagraphs captures the full kernel sequence once and replays it,
         # eliminating all CUDA kernel launch overhead for 32 encoder layers.
-        # Decoder stays eager: KV-cache dict changes every token step, causing
-        # constant dynamo recompilation that makes it slower, not faster.
         try:
             model.encoder = torch.compile(model.encoder, backend="cudagraphs")
             print("  Encoder compiled.")
         except Exception as e:
             print(f"  Encoder compile failed ({e}); running uncompiled.")
+
+    if args.compile_decoder and torch.cuda.is_available():
+        import os
+        os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+        print("Compiling target decoder with torch.compile (inductor, dynamic=True) …")
+        # The hook-free int-indexed KV cache (make_kv_cache) gives a fixed dict
+        # structure across all calls. Combined with dynamic=True, dynamo compiles
+        # exactly two specializations (first call with all-None cache, subsequent
+        # calls with all-(k,v)-tuple cache at variable lengths) and never hits the
+        # cache_size_limit. Speedup: fused GEMM + attention, reduced Python dispatch.
+        try:
+            model.decoder = torch.compile(
+                model.decoder,
+                backend="inductor",
+                dynamic=True,
+            )
+            print("  Decoder compiled.")
+        except Exception as e:
+            print(f"  Decoder compile failed ({e}); running uncompiled.")
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]

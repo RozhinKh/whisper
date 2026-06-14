@@ -145,16 +145,19 @@ class PyTorchInference(Inference):
     def __init__(self, model: "Whisper", initial_token_length: int):
         self.model: "Whisper" = model
         self.initial_token_length = initial_token_length
-        self.kv_cache = {}
-        self.hooks = []
+        self.kv_cache: Optional[dict] = None
+        self.hooks: list = []  # kept for API compat; always empty with new path
 
         key_modules = [block.attn.key for block in self.model.decoder.blocks]
         value_modules = [block.attn.value for block in self.model.decoder.blocks]
         self.kv_modules = key_modules + value_modules
 
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
-        if not self.kv_cache:
-            self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
+        if self.kv_cache is None:
+            # Pre-populate with None sentinels so the dict structure is stable across
+            # all calls (fixed set of integer keys). torch.compile guards on structure,
+            # not on None vs Tensor values, so this prevents cache-limit recompilation.
+            self.kv_cache = self.model.make_kv_cache()
 
         if tokens.shape[-1] > self.initial_token_length:
             # only need to use the last token except in the first forward pass
@@ -163,17 +166,17 @@ class PyTorchInference(Inference):
         return self.model.decoder(tokens, audio_features, kv_cache=self.kv_cache)
 
     def cleanup_caching(self):
-        for hook in self.hooks:
-            hook.remove()
-
-        self.kv_cache = {}
+        self.kv_cache = None
         self.hooks = []
 
     def rearrange_kv_cache(self, source_indices):
-        if source_indices != list(range(len(source_indices))):
-            for module in self.kv_modules:
-                # update the key/value cache to contain the selected sequences
-                self.kv_cache[module] = self.kv_cache[module][source_indices].detach()
+        if source_indices != list(range(len(source_indices))) and self.kv_cache is not None:
+            for idx in range(self.model.decoder._n_kv_entries):
+                val = self.kv_cache[idx]
+                if val is not None:
+                    k, v = val
+                    # Reorder beam hypotheses in-place.
+                    self.kv_cache[idx] = (k[source_indices].detach(), v[source_indices].detach())
 
 
 class SequenceRanker:

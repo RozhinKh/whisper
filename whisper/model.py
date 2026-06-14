@@ -101,6 +101,9 @@ class MultiHeadAttention(nn.Module):
         self.out = Linear(n_state, n_state)
         # Precompute attention scale once to avoid pow/sqrt at every forward call.
         self.scale = (n_state // n_head) ** -0.25
+        # Assigned by TextDecoder.__init__ to enable hook-free int-indexed KV caching.
+        # When None, the legacy hook-based path is used.
+        self._kv_idx: Optional[int] = None
 
     def forward(
         self,
@@ -111,12 +114,41 @@ class MultiHeadAttention(nn.Module):
     ):
         q = self.query(x)
 
-        if kv_cache is None or xa is None or self.key not in kv_cache:
+        if kv_cache is None:
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
+        elif self._kv_idx is not None:
+            # Hook-free path: KV accumulation happens here, not via register_forward_hook.
+            # Cache entries are None (first call) or (k_tensor, v_tensor) tuples.
+            idx = self._kv_idx
+            if xa is not None:
+                # Cross-attention: compute K, V from audio once, then reuse.
+                prev = kv_cache[idx]
+                if prev is None:
+                    k = self.key(xa)
+                    v = self.value(xa)
+                    kv_cache[idx] = (k, v)
+                else:
+                    k, v = prev
+            else:
+                # Self-attention: cat new K, V with accumulated cache.
+                new_k = self.key(x)
+                new_v = self.value(x)
+                prev = kv_cache[idx]
+                if prev is None:
+                    k, v = new_k, new_v
+                else:
+                    k = torch.cat([prev[0], new_k], dim=1)
+                    v = torch.cat([prev[1], new_v], dim=1)
+                kv_cache[idx] = (k, v)
         else:
-            k = kv_cache[self.key]
-            v = kv_cache[self.value]
+            # Legacy hook-based path: K, V already accumulated by register_forward_hook.
+            if xa is None or self.key not in kv_cache:
+                k = self.key(x if xa is None else xa)
+                v = self.value(x if xa is None else xa)
+            else:
+                k = kv_cache[self.key]
+                v = kv_cache[self.value]
 
         wv, qk = self.qkv_attention(q, k, v, mask)
         return self.out(wv), qk
@@ -267,6 +299,15 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
+        # Assign integer KV cache indices to every attention layer so that
+        # KV accumulation can happen inside forward() without register_forward_hook.
+        # Even indices → self-attention; odd indices → cross-attention.
+        for i, block in enumerate(self.blocks):
+            block.attn._kv_idx = 2 * i
+            if block.cross_attn is not None:
+                block.cross_attn._kv_idx = 2 * i + 1
+        self._n_kv_entries: int = 2 * n_layer
+
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
@@ -274,7 +315,18 @@ class TextDecoder(nn.Module):
         xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
             the encoded audio features to be attended on
         """
-        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        if kv_cache:
+            first_val = next(iter(kv_cache.values()))
+            if first_val is None:
+                offset = 0
+            elif isinstance(first_val, tuple):
+                # New int-indexed format: (k, v) tuple; offset = # tokens in self-attn cache.
+                offset = first_val[0].shape[1]
+            else:
+                # Legacy hook-based format: direct tensor.
+                offset = first_val.shape[1]
+        else:
+            offset = 0
         x = (
             self.token_embedding(x)
             + self.positional_embedding[offset : offset + x.shape[-1]]
@@ -364,6 +416,18 @@ class Whisper(nn.Module):
     def num_languages(self):
         return self.dims.n_vocab - 51765 - int(self.is_multilingual)
 
+    def make_kv_cache(self) -> dict:
+        """Return a pre-populated integer-indexed KV cache for hook-free decoding.
+
+        The cache is a plain dict ``{idx: None}`` for all attention indices in
+        the decoder.  Passing this to ``decoder.forward`` activates the hook-free
+        path inside ``MultiHeadAttention.forward``; no ``register_forward_hook``
+        calls are needed.  The fixed structure (same set of integer keys, values
+        transitioning from None to (k, v) tuples) is stable across calls, which
+        lets ``torch.compile`` compile the decoder without cache-limit storms.
+        """
+        return {i: None for i in range(self.decoder._n_kv_entries)}
+
     def install_kv_cache_hooks(self, cache: Optional[dict] = None):
         """
         The `MultiHeadAttention` module optionally accepts `kv_cache` which stores the key and value
@@ -414,7 +478,9 @@ class Whisper(nn.Module):
             return cache[module]
 
         def install_hooks(layer: nn.Module):
-            if isinstance(layer, MultiHeadAttention):
+            if isinstance(layer, MultiHeadAttention) and layer._kv_idx is None:
+                # Skip layers using the hook-free int-indexed path to avoid
+                # double-accumulation (hooks would conflict with forward() logic).
                 hooks.append(layer.key.register_forward_hook(save_to_cache))
                 hooks.append(layer.value.register_forward_hook(save_to_cache))
 
