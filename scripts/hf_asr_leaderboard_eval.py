@@ -99,6 +99,10 @@ def main():
     parser.add_argument("--use-compile", action="store_true")
     parser.add_argument("--draft-model", default=None,
                         help="Enable speculative decoding with this draft model (e.g. 'tiny').")
+    parser.add_argument("--spec-window", type=int, default=5,
+                        help="Number of tokens the draft model proposes per round (default 5). "
+                             "Smaller values reduce float16 batch-vs-sequential divergence at "
+                             "the cost of slightly less speedup.")
     parser.add_argument("--language", default="en")
     parser.add_argument("--output", default="artemis_results.json")
     args = parser.parse_args()
@@ -110,7 +114,7 @@ def main():
     print(f"Device    : {gpu_name}")
     print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size}  temp={args.temperature})")
     if use_speculative:
-        print(f"Draft     : {args.draft_model}  (speculative decoding)")
+        print(f"Draft     : {args.draft_model}  (speculative decoding, window={args.spec_window})")
     print(f"Dataset   : {args.dataset}")
     print()
 
@@ -209,6 +213,7 @@ def main():
                         model, draft_model, audio_array,
                         language=args.language,
                         fp16=(args.compute_type == "float16"),
+                        spec_window=args.spec_window,
                     )
                 else:
                     result = model.transcribe(
