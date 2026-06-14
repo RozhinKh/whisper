@@ -134,15 +134,41 @@ class MultiHeadAttention(nn.Module):
             # scaled_dot_product_attention auto-selects Flash Attention on Ampere
             # when inputs are fp16/bf16 and head_dim <= 128. The sdp_kernel
             # context manager is not traceable by torch.compile(fullgraph=True).
-            a = scaled_dot_product_attention(
-                q, k, v, is_causal=mask is not None and n_ctx > 1
-            )
+            k_len = k.shape[2]
+            if mask is not None and n_ctx > 1 and k_len > n_ctx:
+                # KV-cache batch verification: k_len > q_len.
+                # SDPA's is_causal=True uses an upper-left mask (query i sees keys
+                # 0..i only), but we need a lower-right mask (query i sees keys
+                # 0..i+offset where offset = k_len - n_ctx) so that each query
+                # attends to all previously cached keys plus its own.
+                offset = k_len - n_ctx
+                valid = torch.ones(n_ctx, k_len, dtype=torch.bool, device=q.device).tril(
+                    diagonal=offset
+                )
+                attn_bias = torch.zeros(n_ctx, k_len, dtype=q.dtype, device=q.device)
+                attn_bias.masked_fill_(~valid, float("-inf"))
+                a = scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+            else:
+                a = scaled_dot_product_attention(
+                    q, k, v, is_causal=mask is not None and n_ctx > 1
+                )
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
         else:
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
+            # qk shape: [batch, n_head, n_ctx, k_len]; k.shape[2] = k_len after permute
             if mask is not None:
-                qk = qk + mask[:n_ctx, :n_ctx]
+                k_len = k.shape[2]
+                if k_len > n_ctx:
+                    offset = k_len - n_ctx
+                    lr_mask = torch.zeros(n_ctx, k_len, dtype=qk.dtype, device=qk.device)
+                    lr_mask.masked_fill_(
+                        torch.ones(n_ctx, k_len, dtype=torch.bool, device=qk.device).triu(diagonal=offset + 1),
+                        float("-inf"),
+                    )
+                    qk = qk + lr_mask
+                else:
+                    qk = qk + mask[:n_ctx, :n_ctx]
             qk = qk.float()
             w = F.softmax(qk, dim=-1).to(q.dtype)
             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
