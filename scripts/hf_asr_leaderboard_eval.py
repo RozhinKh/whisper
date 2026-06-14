@@ -125,18 +125,25 @@ def main():
         print(f"Draft model loaded: {args.draft_model}")
 
     if args.use_compile and torch.cuda.is_available():
-        print("Compiling with torch.compile (reduce-overhead) …")
-        try:
-            model.encoder = torch.compile(model.encoder, mode="reduce-overhead")
-            print("  Encoder compiled.")
-        except Exception as e:
-            print(f"  Encoder compile failed ({e})")
-        try:
-            # dynamic=True handles variable KV-cache length across decoding steps
-            model.decoder = torch.compile(model.decoder, mode="reduce-overhead", dynamic=True)
-            print("  Decoder compiled.")
-        except Exception as e:
-            print(f"  Decoder compile failed ({e}); decoder runs uncompiled.")
+        import os
+        # Single-threaded compilation avoids inductor subprocess pool crashes on
+        # memory-limited machines. cudagraphs backend is more stable than inductor
+        # for inference-only use and works well with fixed encoder shape [1,128,3000].
+        os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+        print("Compiling with torch.compile …")
+        for name, mod in [("encoder", model.encoder), ("decoder", model.decoder)]:
+            for backend in ("cudagraphs", "eager"):
+                try:
+                    compiled = torch.compile(mod, backend=backend, dynamic=True)
+                    # Assign back
+                    if name == "encoder":
+                        model.encoder = compiled
+                    else:
+                        model.decoder = compiled
+                    print(f"  {name.capitalize()} compiled (backend={backend}).")
+                    break
+                except Exception as e:
+                    print(f"  {name.capitalize()} compile failed with {backend}: {e}")
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]
