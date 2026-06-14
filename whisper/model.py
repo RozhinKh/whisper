@@ -119,28 +119,33 @@ class MultiHeadAttention(nn.Module):
             v = self.value(x if xa is None else xa)
         elif self._kv_idx is not None:
             # Hook-free path: KV accumulation happens here, not via register_forward_hook.
-            # Cache entries are None (first call) or (k_tensor, v_tensor) tuples.
+            # Cache entries are mutable lists [k_or_None, v_or_None].  Using lists
+            # (not tuples) keeps the same Python object in kv_cache[idx] across all
+            # calls — only list[0]/[1] change.  dynamo guards on ___check_obj_id of
+            # the *list*, which is stable, so there are no cache_size_limit storms.
             idx = self._kv_idx
+            entry = kv_cache[idx]  # always the same list object
             if xa is not None:
                 # Cross-attention: compute K, V from audio once, then reuse.
-                prev = kv_cache[idx]
-                if prev is None:
+                if entry[0] is None:
                     k = self.key(xa)
                     v = self.value(xa)
-                    kv_cache[idx] = (k, v)
+                    entry[0] = k
+                    entry[1] = v
                 else:
-                    k, v = prev
+                    k = entry[0]
+                    v = entry[1]
             else:
                 # Self-attention: cat new K, V with accumulated cache.
                 new_k = self.key(x)
                 new_v = self.value(x)
-                prev = kv_cache[idx]
-                if prev is None:
+                if entry[0] is None:
                     k, v = new_k, new_v
                 else:
-                    k = torch.cat([prev[0], new_k], dim=1)
-                    v = torch.cat([prev[1], new_v], dim=1)
-                kv_cache[idx] = (k, v)
+                    k = torch.cat([entry[0], new_k], dim=1)
+                    v = torch.cat([entry[1], new_v], dim=1)
+                entry[0] = k
+                entry[1] = v
         else:
             # Legacy hook-based path: K, V already accumulated by register_forward_hook.
             if xa is None or self.key not in kv_cache:
@@ -307,6 +312,10 @@ class TextDecoder(nn.Module):
             if block.cross_attn is not None:
                 block.cross_attn._kv_idx = 2 * i + 1
         self._n_kv_entries: int = 2 * n_layer
+        # Note: make_kv_cache() uses mutable lists [k, v] as values (not tuples).
+        # The list object identity is stable across calls (we update list[0]/[1]
+        # in-place rather than replacing the dict value). This prevents dynamo from
+        # emitting ___check_obj_id guards on every call → no cache_size_limit storms.
 
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
@@ -317,11 +326,11 @@ class TextDecoder(nn.Module):
         """
         if kv_cache:
             first_val = next(iter(kv_cache.values()))
-            if first_val is None:
+            if isinstance(first_val, list):
+                # New int-indexed format: [k_or_None, v_or_None] list.
+                offset = 0 if first_val[0] is None else first_val[0].shape[1]
+            elif first_val is None:
                 offset = 0
-            elif isinstance(first_val, tuple):
-                # New int-indexed format: (k, v) tuple; offset = # tokens in self-attn cache.
-                offset = first_val[0].shape[1]
             else:
                 # Legacy hook-based format: direct tensor.
                 offset = first_val.shape[1]
@@ -426,7 +435,7 @@ class Whisper(nn.Module):
         transitioning from None to (k, v) tuples) is stable across calls, which
         lets ``torch.compile`` compile the decoder without cache-limit storms.
         """
-        return {i: None for i in range(self.decoder._n_kv_entries)}
+        return {i: [None, None] for i in range(self.decoder._n_kv_entries)}
 
     def install_kv_cache_hooks(self, cache: Optional[dict] = None):
         """

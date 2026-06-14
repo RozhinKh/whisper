@@ -172,11 +172,11 @@ class PyTorchInference(Inference):
     def rearrange_kv_cache(self, source_indices):
         if source_indices != list(range(len(source_indices))) and self.kv_cache is not None:
             for idx in range(self.model.decoder._n_kv_entries):
-                val = self.kv_cache[idx]
-                if val is not None:
-                    k, v = val
-                    # Reorder beam hypotheses in-place.
-                    self.kv_cache[idx] = (k[source_indices].detach(), v[source_indices].detach())
+                entry = self.kv_cache[idx]  # [k_or_None, v_or_None] mutable list
+                if entry[0] is not None:
+                    # Update list contents in-place to preserve the list's object identity.
+                    entry[0] = entry[0][source_indices].detach()
+                    entry[1] = entry[1][source_indices].detach()
 
 
 class SequenceRanker:

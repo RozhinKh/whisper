@@ -42,20 +42,22 @@ def _to_mel(audio: np.ndarray, n_mels: int, device, dtype) -> torch.Tensor:
 def _truncate_kv(cache: dict, length: int) -> None:
     """Truncate self-attention KV entries to `length` tokens in-place.
 
-    In the int-indexed cache, even indices hold self-attention (k, v) tuples
-    and odd indices hold cross-attention (k, v) tuples.  Only self-attention
+    In the int-indexed cache, even indices hold self-attention [k, v] lists
+    and odd indices hold cross-attention [k, v] lists.  Only self-attention
     entries are truncated; cross-attention (computed from fixed audio features)
-    is left untouched.
+    is left untouched.  List contents are updated in-place to preserve list
+    object identity (required for stable dynamo guards).
     """
-    for idx, val in cache.items():
-        if val is None:
+    for idx, entry in cache.items():
+        if entry[0] is None:
             continue
         if idx % 2 != 0:
             # Odd index → cross-attention; leave alone.
             continue
-        k, v = val
+        k = entry[0]
         if k.shape[1] > length:
-            cache[idx] = (k[:, :length], v[:, :length])
+            entry[0] = k[:, :length]
+            entry[1] = entry[1][:, :length]
 
 
 def speculative_transcribe(
