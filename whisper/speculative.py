@@ -131,6 +131,34 @@ def speculative_transcribe(
     eot = tokenizer.eot
     n_init = len(init)
 
+    # Replicate Whisper's SuppressTokens + ApplyTimestampRules (no-timestamps mode).
+    # model.transcribe() applies these via LogitFilter; raw argmax without them
+    # causes speculative to occasionally emit suppressed tokens the baseline never would.
+    # Taking argmax in float32 also avoids float16 tie-breaking divergence vs sequential.
+    _non_speech = set(tokenizer.non_speech_tokens)
+    _ts_begin = tokenizer.timestamp_begin
+    _n_vocab_t = target.dims.n_vocab
+    _n_vocab_d = draft.dims.n_vocab
+    _t_mask = torch.zeros(_n_vocab_t, dtype=torch.bool, device=t_dev)
+    _d_mask = torch.zeros(_n_vocab_d, dtype=torch.bool, device=d_dev)
+    for _tid in _non_speech:
+        if _tid < _n_vocab_t:
+            _t_mask[_tid] = True
+        if _tid < _n_vocab_d:
+            _d_mask[_tid] = True
+    _t_mask[_ts_begin:] = True
+    _d_mask[_ts_begin:] = True
+
+    def _argmax_t(logits: torch.Tensor) -> int:
+        lg = logits.float()
+        lg[_t_mask] = float("-inf")
+        return int(lg.argmax())
+
+    def _argmax_d(logits: torch.Tensor) -> int:
+        lg = logits.float()
+        lg[_d_mask] = float("-inf")
+        return int(lg.argmax())
+
     # Install our own simple KV hooks (torch.cat based — no _buf/_pos state).
     t_cache, t_hooks = _install_kv_hooks(target)
     d_cache, d_hooks = _install_kv_hooks(draft)
@@ -168,7 +196,7 @@ def speculative_transcribe(
             d_inp = torch.tensor([[tokens[-1]]], device=d_dev, dtype=torch.long)
             for _ in range(effective_window):
                 d_log = draft.decoder(d_inp, d_feat, kv_cache=d_cache)
-                tok = int(d_log[0, -1].argmax())
+                tok = _argmax_d(d_log[0, -1])
                 proposals.append(tok)
                 if tok == eot:
                     break
@@ -190,7 +218,7 @@ def speculative_transcribe(
             # ── ACCEPT / REJECT ───────────────────────────────────────────────
             n_acc = 0
             correction: Optional[int] = None
-            target_preds = [int(t_log[0, i].argmax()) for i in range(k)]
+            target_preds = [_argmax_t(t_log[0, i]) for i in range(k)]
             for i, dp in enumerate(proposals):
                 tp = target_preds[i]
                 if tp == dp:
@@ -208,7 +236,7 @@ def speculative_transcribe(
             if correction is None:
                 # All k draft tokens accepted — take one free bonus token.
                 # Target cache at pos+k = len(tokens)-1+1 (need one more step).
-                bonus = int(t_log[0, n_acc].argmax())
+                bonus = _argmax_t(t_log[0, n_acc])
                 tokens.append(bonus)
                 if bonus == eot:
                     break
