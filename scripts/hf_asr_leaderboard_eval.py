@@ -125,37 +125,17 @@ def main():
         print(f"Draft model loaded: {args.draft_model}")
 
     if args.use_compile and torch.cuda.is_available():
-        import os
-        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
-        print("Compiling with torch.compile …")
-
-        # Encoder: cudagraphs — always [1, n_mels, 3000], captured once, replayed.
+        print("Compiling encoder with torch.compile (cudagraphs) …")
+        # Encoder input is always [1, n_mels, 3000] — fixed shape.
+        # cudagraphs captures the full kernel sequence once and replays it,
+        # eliminating all CUDA kernel launch overhead for 32 encoder layers.
+        # Decoder stays eager: KV-cache dict changes every token step, causing
+        # constant dynamo recompilation that makes it slower, not faster.
         try:
             model.encoder = torch.compile(model.encoder, backend="cudagraphs")
-            print("  Encoder compiled (cudagraphs).")
+            print("  Encoder compiled.")
         except Exception as e:
-            print(f"  Encoder compile failed: {e}")
-
-        # Decoder: the KV-cache dict (passed as kv_cache arg) changes every token
-        # step, causing dynamo to hit cache_size_limit and recompile constantly when
-        # the full decoder is compiled. Instead compile only the hook-free parts:
-        #   qkv_attention — pure tensor math (scale, dot product, softmax, projection)
-        #   mlp           — two linear layers + GELU, no hooks
-        # The K/V linear projections have forward hooks for caching and stay eager.
-        n_blocks = 0
-        try:
-            for block in model.decoder.blocks:
-                block.attn.qkv_attention = torch.compile(
-                    block.attn.qkv_attention, mode="reduce-overhead"
-                )
-                block.cross_attn.qkv_attention = torch.compile(
-                    block.cross_attn.qkv_attention, mode="reduce-overhead"
-                )
-                block.mlp = torch.compile(block.mlp, mode="reduce-overhead")
-                n_blocks += 1
-            print(f"  Decoder: {n_blocks} blocks compiled (qkv_attention + mlp).")
-        except Exception as e:
-            print(f"  Decoder block compile failed at block {n_blocks}: {e}")
+            print(f"  Encoder compile failed ({e}); running uncompiled.")
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]
