@@ -49,7 +49,7 @@ DATASET_CONFIGS = {
         "streaming": True,
     },
     "common_voice": {
-        "path": "mozilla-foundation/common_voice_15_0",
+        "path": "mozilla-foundation/common_voice_17_0",
         "name": "en",
         "split": "test",
         "audio_col": "audio",
