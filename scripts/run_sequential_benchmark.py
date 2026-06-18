@@ -52,6 +52,8 @@ def main():
     parser.add_argument("--output", default="results_sequential.json")
     parser.add_argument("--compute-type", default="float16", choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Decoding temperature. 0.0 = greedy with no fallback (default).")
     parser.add_argument("--use-compile", action="store_true")
     parser.add_argument("--draft-model", default=None,
                         help="Enable speculative decoding with this draft model (e.g. 'base').")
@@ -117,6 +119,7 @@ def main():
             result = speculative_transcribe(
                 model, draft_model, audio_array,
                 fp16=(args.compute_type == "float16"),
+                temperature=args.temperature,
                 spec_window=args.spec_window,
             )
         else:

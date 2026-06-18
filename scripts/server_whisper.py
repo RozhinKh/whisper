@@ -68,6 +68,7 @@ def _transcribe(tmp_path: str, language):
             _model, _draft_model, audio_array,
             language=lang,
             fp16=(args.compute_type == "float16"),
+            temperature=args.temperature,
             spec_window=args.spec_window,
         )
     else:

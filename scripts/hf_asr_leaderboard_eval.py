@@ -241,6 +241,7 @@ def main():
                         model, draft_model, audio_array,
                         language=args.language,
                         fp16=(args.compute_type == "float16"),
+                        temperature=args.temperature,
                         spec_window=args.spec_window,
                     )
                 else:

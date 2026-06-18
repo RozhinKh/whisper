@@ -66,6 +66,7 @@ def speculative_transcribe(
     audio: np.ndarray,
     language: str = "en",
     fp16: bool = True,
+    temperature: float = 0.0,
     spec_window: int = _SPEC_WINDOW,
     max_new_tokens: int = 448,
 ) -> dict:
@@ -84,6 +85,13 @@ def speculative_transcribe(
         BCP-47 language code passed to the tokenizer.
     fp16 : bool
         Run inference in float16 when True.
+    temperature : float
+        Decoding temperature for the >30s fallback path (see below). Must match
+        the baseline's temperature for an apples-to-apples comparison — Whisper's
+        default temperature fallback ladder (0.0, 0.2, ..., 1.0) silently retries
+        a chunk at higher temperatures when quality heuristics aren't met, which
+        otherwise makes this path multiple times slower than the baseline it's
+        being compared against.
     spec_window : int
         Number of tokens the draft proposes per verification round.
     max_new_tokens : int
@@ -94,7 +102,9 @@ def speculative_transcribe(
     dict with key "text" — same shape as model.transcribe() output.
     """
     if len(audio) > N_SAMPLES:
-        return target.transcribe(audio, language=language, fp16=fp16, beam_size=1)
+        return target.transcribe(
+            audio, language=language, fp16=fp16, beam_size=1, temperature=temperature
+        )
 
     dtype = torch.float16 if fp16 else torch.float32
     t_dev = target.device
