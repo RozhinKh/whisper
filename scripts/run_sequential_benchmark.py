@@ -19,6 +19,8 @@ import time
 
 import torch
 import whisper
+from jiwer import wer as compute_wer
+from whisper.normalizers import EnglishTextNormalizer
 
 
 def load_artemis_manifest(artemis_dir: str):
@@ -51,7 +53,11 @@ def main():
     parser.add_argument("--compute-type", default="float16", choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument("--draft-model", default=None,
+                        help="Enable speculative decoding with this draft model (e.g. 'base').")
+    parser.add_argument("--spec-window", type=int, default=5)
     args = parser.parse_args()
+    use_speculative = args.draft_model is not None
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device     : {torch.cuda.get_device_name(0) if device == 'cuda' else 'CPU'}")
@@ -59,13 +65,23 @@ def main():
     print(f"Compute    : {args.compute_type}")
     print(f"Beam size  : {args.beam_size}")
     print(f"Compile    : {args.use_compile}")
+    if use_speculative:
+        print(f"Draft      : {args.draft_model}  (speculative decoding, window={args.spec_window})")
     print()
 
-    model = whisper.load_model(
-        "large-v3",
-        compute_type=args.compute_type,
-        use_compile=args.use_compile,
-    )
+    model = whisper.load_model("large-v3")
+    if use_speculative:
+        from whisper.speculative import speculative_transcribe
+        draft_model = whisper.load_model(args.draft_model)
+        print(f"Draft model loaded: {args.draft_model}")
+
+    if args.use_compile and device == "cuda":
+        print("Compiling encoder with torch.compile (cudagraphs) …")
+        try:
+            model.encoder = torch.compile(model.encoder, backend="cudagraphs")
+            print("  Encoder compiled.")
+        except Exception as e:
+            print(f"  Encoder compile failed ({e}); running uncompiled.")
 
     manifest = load_artemis_manifest(args.artemis_dir)
     if manifest is None:
@@ -76,7 +92,9 @@ def main():
         ]
         manifest = [{"audio": f, "reference": ""} for f in sorted(files)]
 
+    normalizer = EnglishTextNormalizer()
     results = []
+    hypotheses, references = [], []
     total_audio_s = 0.0
     total_infer_s = 0.0
 
@@ -94,11 +112,19 @@ def main():
         torch.cuda.synchronize() if device == "cuda" else None
         t0 = time.perf_counter()
 
-        result = model.transcribe(
-            audio_path,
-            beam_size=args.beam_size,
-            fp16=(args.compute_type == "float16"),
-        )
+        if use_speculative:
+            audio_array = whisper.audio.load_audio(audio_path)
+            result = speculative_transcribe(
+                model, draft_model, audio_array,
+                fp16=(args.compute_type == "float16"),
+                spec_window=args.spec_window,
+            )
+        else:
+            result = model.transcribe(
+                audio_path,
+                beam_size=args.beam_size,
+                fp16=(args.compute_type == "float16"),
+            )
 
         torch.cuda.synchronize() if device == "cuda" else None
         elapsed = time.perf_counter() - t0
@@ -116,7 +142,12 @@ def main():
             "language": result.get("language", ""),
         }
         results.append(entry_result)
+        if entry.get("reference"):
+            hypotheses.append(normalizer(entry_result["hypothesis"]))
+            references.append(normalizer(entry["reference"]))
         print(f"[{i+1}/{len(manifest)}] {entry['audio']:40s}  RTF={entry_result['rtf']:.3f}  {elapsed:.2f}s")
+
+    overall_wer = 100 * compute_wer(references, hypotheses) if references else None
 
     summary = {
         "config": {
@@ -124,12 +155,15 @@ def main():
             "compute_type": args.compute_type,
             "beam_size": args.beam_size,
             "use_compile": args.use_compile,
+            "draft_model": args.draft_model,
             "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
         },
         "total_audio_s": total_audio_s,
         "total_inference_s": total_infer_s,
         "overall_rtf": rtf(total_audio_s, total_infer_s),
+        "overall_wer": overall_wer,
         "n_files": len(results),
+        "n_scored": len(references),
         "results": results,
     }
 
@@ -137,6 +171,10 @@ def main():
         json.dump(summary, f, indent=2)
 
     print(f"\nOverall RTF : {summary['overall_rtf']:.4f}")
+    if overall_wer is not None:
+        print(f"Overall WER : {overall_wer:.3f}%  ({len(references)}/{len(results)} files had references)")
+    else:
+        print("Overall WER : n/a (no reference text in manifest)")
     print(f"Results     : {args.output}")
 
 
