@@ -12,7 +12,13 @@ Each verification round:
 
 Net: each round accepts >= 1 token using exactly 1 target forward pass instead
 of spec_window passes, reducing target decoder calls by ~(acceptance_rate * window).
-Falls back to standard transcription for audio longer than 30 seconds.
+
+Long-form audio (> 30s) is split into fixed N_SAMPLES (30s) chunks and each
+chunk is decoded independently with speculative decoding, then concatenated.
+This is simpler than Whisper's native timestamp-based seeking (no VAD-based
+boundaries, no cross-chunk text conditioning), so transcription quality at
+chunk boundaries may be slightly worse than model.transcribe()'s long-form
+algorithm — but every chunk gets the full speculative-decoding speedup.
 
 KV cache design
 ---------------
@@ -80,32 +86,53 @@ def speculative_transcribe(
     draft : Whisper
         Smaller draft model (e.g. tiny).  Must share the same tokenizer vocabulary.
     audio : np.ndarray
-        Raw waveform at 16 kHz, float32.
+        Raw waveform at 16 kHz, float32.  Audio longer than 30s is split into
+        fixed N_SAMPLES chunks, each decoded independently (see module docstring).
     language : str
         BCP-47 language code passed to the tokenizer.
     fp16 : bool
         Run inference in float16 when True.
     temperature : float
-        Decoding temperature for the >30s fallback path (see below). Must match
-        the baseline's temperature for an apples-to-apples comparison — Whisper's
-        default temperature fallback ladder (0.0, 0.2, ..., 1.0) silently retries
-        a chunk at higher temperatures when quality heuristics aren't met, which
-        otherwise makes this path multiple times slower than the baseline it's
-        being compared against.
+        Unused — speculative decoding is always greedy (argmax). Accepted for
+        call-site compatibility with model.transcribe()'s signature.
     spec_window : int
         Number of tokens the draft proposes per verification round.
     max_new_tokens : int
-        Hard cap on generated tokens (excluding initial prompt).
+        Hard cap on generated tokens per chunk (excluding initial prompt).
 
     Returns
     -------
     dict with key "text" — same shape as model.transcribe() output.
     """
-    if len(audio) > N_SAMPLES:
-        return target.transcribe(
-            audio, language=language, fp16=fp16, beam_size=1, temperature=temperature
+    if len(audio) <= N_SAMPLES:
+        return _speculative_transcribe_chunk(
+            target, draft, audio, language, fp16, spec_window, max_new_tokens
         )
 
+    texts: List[str] = []
+    for start in range(0, len(audio), N_SAMPLES):
+        chunk = audio[start : start + N_SAMPLES]
+        if len(chunk) == 0:
+            continue
+        result = _speculative_transcribe_chunk(
+            target, draft, chunk, language, fp16, spec_window, max_new_tokens
+        )
+        text = result["text"].strip()
+        if text:
+            texts.append(text)
+    return {"text": " ".join(texts)}
+
+
+def _speculative_transcribe_chunk(
+    target,
+    draft,
+    audio: np.ndarray,
+    language: str,
+    fp16: bool,
+    spec_window: int,
+    max_new_tokens: int,
+) -> dict:
+    """Speculative decoding for a single chunk of audio (<= N_SAMPLES, i.e. <= 30s)."""
     dtype = torch.float16 if fp16 else torch.float32
     t_dev = target.device
     d_dev = draft.device
