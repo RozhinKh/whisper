@@ -48,12 +48,14 @@ use_speculative = args.draft_model is not None
 print(f"Loading model: {args.model}  compute={args.compute_type}  "
       f"beam={args.beam_size}  device={args.device}")
 if use_speculative:
-    print(f"Speculative decoding enabled, draft={args.draft_model}, window={args.spec_window}")
+    mode = "beam-search (EXPERIMENTAL)" if args.beam_size > 1 else "greedy"
+    print(f"Speculative decoding enabled ({mode}), draft={args.draft_model}, "
+          f"beam={args.beam_size}, window={args.spec_window}")
 
 _model = whisper.load_model(args.model, device=args.device)
 _draft_model = whisper.load_model(args.draft_model, device=args.device) if use_speculative else None
 if use_speculative:
-    from whisper.speculative import speculative_transcribe
+    from whisper.speculative import speculative_transcribe, speculative_transcribe_beam
 
 print(f"Model ready. Listening on port {args.port} ...")
 
@@ -62,7 +64,16 @@ app = Flask(__name__)
 
 def _transcribe(tmp_path: str, language):
     lang = language or args.language or "en"
-    if use_speculative:
+    if use_speculative and args.beam_size > 1:
+        audio_array = whisper.audio.load_audio(tmp_path)
+        result = speculative_transcribe_beam(
+            _model, _draft_model, audio_array,
+            language=lang,
+            fp16=(args.compute_type == "float16"),
+            beam_size=args.beam_size,
+            spec_window=args.spec_window,
+        )
+    elif use_speculative:
         audio_array = whisper.audio.load_audio(tmp_path)
         result = speculative_transcribe(
             _model, _draft_model, audio_array,
