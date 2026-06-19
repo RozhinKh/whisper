@@ -575,6 +575,13 @@ def speculative_transcribe_beam(
         for seq, sc in zip(beam_tokens, beam_scores):
             finished.append((seq, sc))
 
+        import os
+        if os.environ.get("SPEC_BEAM_DEBUG"):
+            for seq, sc in finished:
+                length = len(seq) - n_init
+                txt = tokenizer.decode([t for t in seq[n_init:] if t < eot]).strip()
+                print(f"[finished] len={length} score={sc:.2f} norm={sc/max(length,1):.4f} text={txt[:80]!r}", flush=True)
+
         if not finished:
             return {"text": ""}
 
