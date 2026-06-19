@@ -416,11 +416,18 @@ def speculative_transcribe_beam(
         while total_new < max_new_tokens and beam_tokens:
             b = len(beam_tokens)
             cur_len = len(beam_tokens[0])
+            import os
+            if os.environ.get("SPEC_BEAM_DEBUG"):
+                print(f"[round] b={b} cur_len={cur_len} lens={[len(s) for s in beam_tokens]} "
+                      f"next_draft_input={next_draft_input} t_feat.shape={tuple(t_feat.shape)} "
+                      f"d_feat.shape={tuple(d_feat.shape)}", flush=True)
 
             window = max(1, min(spec_window, target.dims.n_text_ctx - cur_len - 1))
 
             # ── DRAFT PHASE (batched across b beams) ──────────────────────
             d_inp = torch.tensor([[t] for t in next_draft_input], device=d_dev, dtype=torch.long)
+            if os.environ.get("SPEC_BEAM_DEBUG"):
+                print(f"[round] window={window} d_inp.shape={tuple(d_inp.shape)}", flush=True)
             proposals: List[List[int]] = [[] for _ in range(b)]
             active = [True] * b
             for _ in range(window):
