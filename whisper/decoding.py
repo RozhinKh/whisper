@@ -171,7 +171,14 @@ class PyTorchInference(Inference):
 
     def rearrange_kv_cache(self, source_indices):
         if source_indices != list(range(len(source_indices))) and self.kv_cache is not None:
-            for idx in range(self.model.decoder._n_kv_entries):
+            # Even indices = self-attention (batch = token batch, needs reordering
+            # as beams shuffle). Odd indices = cross-attention, computed once from
+            # audio features at batch=n_audio and broadcast against the larger
+            # beam batch in SDPA — it never grows to match beam_size, so indexing
+            # it with beam-length source_indices goes out of bounds. Skip it,
+            # matching the original hook-based implementation's behavior (which
+            # only ever touched block.attn.key/value, never block.cross_attn).
+            for idx in range(0, self.model.decoder._n_kv_entries, 2):
                 entry = self.kv_cache[idx]  # [k_or_None, v_or_None] mutable list
                 if entry[0] is not None:
                     # Update list contents in-place to preserve the list's object identity.
