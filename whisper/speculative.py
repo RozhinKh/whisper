@@ -426,60 +426,69 @@ def speculative_transcribe_beam(
                 break
 
             # ── DRAFT PHASE (batched across b beams) ──────────────────────
-            d_inp = torch.tensor([[t] for t in next_draft_input], device=d_dev, dtype=torch.long)
-            proposals: List[List[int]] = [[] for _ in range(b)]
-            active = [True] * b
-            for _ in range(window):
+            # Vectorized across the beam dimension and kept entirely on-GPU
+            # until the very end of the window: argmax + active-mask select
+            # happen as single batched ops, and the chosen tokens feed
+            # straight back into the next decoder call as a GPU tensor (no
+            # .item()/int() per beam per step). Each such conversion forces
+            # a CPU-GPU sync that stalls the pipeline; doing window*b of them
+            # serially (the previous Python-loop version) is pure overhead
+            # with no effect on the actual math — same algorithm, same
+            # output, just executed without needless synchronization.
+            d_inp = torch.tensor([next_draft_input], device=d_dev, dtype=torch.long).T
+            proposals_t = torch.full((b, window), eot, dtype=torch.long, device=d_dev)
+            active = torch.ones(b, dtype=torch.bool, device=d_dev)
+            eot_const = torch.tensor(eot, device=d_dev, dtype=torch.long)
+            for step in range(window):
                 d_log = draft.decoder(d_inp, d_feat, kv_cache=d_cache)
-                step_tok = []
-                for i in range(b):
-                    if not active[i]:
-                        step_tok.append(eot)
-                        continue
-                    lg = d_log[i, -1].float()
-                    lg[_d_mask] = float("-inf")
-                    tok = int(lg.argmax())
-                    proposals[i].append(tok)
-                    if tok == eot:
-                        active[i] = False
-                    step_tok.append(tok)
-                d_inp = torch.tensor([[t] for t in step_tok], device=d_dev, dtype=torch.long)
+                lg = d_log[:, -1, :].float()
+                lg[:, _d_mask] = float("-inf")
+                toks = lg.argmax(dim=-1)  # [b], stays on GPU
+                toks = torch.where(active, toks, eot_const)
+                proposals_t[:, step] = toks
+                active = active & (toks != eot)
+                d_inp = toks.unsqueeze(1)
 
             k = window
-            for i in range(b):
-                while len(proposals[i]) < k:
-                    proposals[i].append(eot)
 
             # ── VERIFY PHASE (batched, one target call for all b beams) ───
-            v_inp = torch.tensor(
-                [[beam_tokens[i][-1]] + proposals[i] for i in range(b)],
-                device=t_dev, dtype=torch.long,
-            )
+            pending = torch.tensor([beam_tokens[i][-1] for i in range(b)], device=t_dev, dtype=torch.long)
+            v_inp = torch.cat([pending.unsqueeze(1), proposals_t.to(t_dev)], dim=1)
             t_log = target.decoder(v_inp, t_feat, kv_cache=t_cache)  # [b, k+1, vocab]
 
-            # ── PER-BEAM GREEDY ACCEPT WALK (vs target argmax) ─────────────
-            accept_counts = [0] * b
-            for i in range(b):
-                for pos in range(k):
-                    logits = t_log[i, pos].float()
-                    logits[_t_mask] = float("-inf")
-                    if int(logits.argmax()) == proposals[i][pos]:
-                        accept_counts[i] += 1
-                        if proposals[i][pos] == eot:
-                            break
-                    else:
-                        break
+            # ── PER-BEAM GREEDY ACCEPT WALK (vs target argmax), vectorized ──
+            logits_block = t_log[:, :k, :].float()
+            logits_block[..., _t_mask] = float("-inf")
+            argmaxes = logits_block.argmax(dim=-1)  # [b, k]
+            proposals_tt = proposals_t.to(t_dev)
+            matches = argmaxes == proposals_tt  # [b, k] bool
 
+            # A drafted EOT (real or padding-after-active=False) must not be
+            # "accepted past" even if the target also predicts EOT at a later
+            # padded position — clip matches to at-and-before each beam's
+            # first drafted EOT, matching the original per-beam early break.
+            eot_mask = proposals_tt == eot
+            has_eot = eot_mask.any(dim=1)
+            first_eot_pos = torch.where(
+                has_eot, eot_mask.float().argmax(dim=1), torch.full((b,), k, device=t_dev, dtype=torch.long)
+            )
+            pos_idx = torch.arange(k, device=t_dev).unsqueeze(0)
+            matches = matches & (pos_idx <= first_eot_pos.unsqueeze(1))
+
+            # Leading-true count per row: cumprod of 0/1 is 1 until the first
+            # 0, then 0 forever after; summing gives exactly the count of
+            # consecutive accepted tokens from the start.
+            accept_counts_t = matches.long().cumprod(dim=1).sum(dim=1)  # [b]
+            accept_counts = accept_counts_t.tolist()  # single CPU sync
             common = min(accept_counts)
+            proposals = proposals_t.tolist()  # single CPU sync, used below for indexing
 
             # If every beam fully accepted its window, draft's cache is one
             # token short: the draft loop never feeds its own last proposal
             # back in (same reasoning as the greedy path's "bonus" catch-up
             # call), so it needs an explicit advance here before truncation.
             if common == k:
-                last_prop = torch.tensor(
-                    [[proposals[i][common - 1]] for i in range(b)], device=d_dev, dtype=torch.long
-                )
+                last_prop = proposals_t[:, common - 1 : common]  # [b, 1], already on d_dev
                 draft.decoder(last_prop, d_feat, kv_cache=d_cache)
 
             # Truncate caches to the common accepted length so the batch
@@ -492,14 +501,15 @@ def speculative_transcribe_beam(
             _truncate_kv(t_cache, common_cache_len)
             _truncate_kv(d_cache, common_cache_len)
 
-            common_logprobs = [0.0] * b
-            for i in range(b):
-                lp = 0.0
-                for pos in range(common):
-                    logits = t_log[i, pos].float()
-                    logits[_t_mask] = float("-inf")
-                    lp += float(torch.log_softmax(logits, dim=-1)[proposals[i][pos]])
-                common_logprobs[i] = lp
+            if common > 0:
+                logits_acc = t_log[:, :common, :].float()
+                logits_acc[..., _t_mask] = float("-inf")
+                logprobs_acc = torch.log_softmax(logits_acc, dim=-1)  # [b, common, vocab]
+                idx = proposals_tt[:, :common].unsqueeze(-1)  # [b, common, 1]
+                gathered = torch.gather(logprobs_acc, dim=2, index=idx).squeeze(-1)  # [b, common]
+                common_logprobs = gathered.sum(dim=1).tolist()  # single CPU sync
+            else:
+                common_logprobs = [0.0] * b
 
             for i in range(b):
                 beam_tokens[i] = beam_tokens[i] + proposals[i][:common]
@@ -531,32 +541,32 @@ def speculative_transcribe_beam(
             branch_logits[:, _t_mask] = float("-inf")
             branch_logprobs = torch.log_softmax(branch_logits, dim=-1)
             topk = min(beam_size, branch_logprobs.shape[-1])
-            top_vals, top_idx = branch_logprobs.topk(topk, dim=-1)
+            top_vals, top_idx = branch_logprobs.topk(topk, dim=-1)  # [b, topk]
 
             # Rank candidates by LENGTH-NORMALIZED score, not raw cumulative
-            # logprob. Raw score systematically favors shorter continuations
-            # (every extra token adds a negative log-prob), which made the
-            # search permanently lock onto short, highly-predictable text
-            # (e.g. repeating chapter-title variants) instead of ever
-            # committing to the less uniformly-confident real narrative —
-            # length normalization is applied live, every round, not just at
-            # final beam selection (same fix Whisper's own
-            # MaximumLikelihoodRanker applies, just also needed mid-search
-            # here since pruning happens every round instead of once).
-            candidates = []
-            for i in range(b):
-                gen_len_i = len(beam_tokens[i]) - n_init
-                for j in range(topk):
-                    tok = int(top_idx[i, j])
-                    raw_sc = beam_scores[i] + float(top_vals[i, j])
-                    norm_sc = raw_sc / max(gen_len_i + 1, 1)
-                    candidates.append((i, tok, raw_sc, norm_sc))
-            candidates.sort(key=lambda c: c[3], reverse=True)
-            candidates = candidates[:beam_size]
+            # logprob, vectorized over the full b*topk candidate pool via a
+            # single flattened topk instead of building Python tuples and
+            # sorting them.  (Length normalization here is a no-op when all
+            # beams share the same length, which they do within one round —
+            # kept for consistency with the final beam-selection criterion,
+            # which does compare beams of different final lengths.)
+            gen_lens = torch.tensor(
+                [len(beam_tokens[i]) - n_init for i in range(b)], device=t_dev, dtype=torch.float
+            )
+            beam_scores_t = torch.tensor(beam_scores, device=t_dev, dtype=torch.float)
+            raw_sc = beam_scores_t.unsqueeze(1) + top_vals  # [b, topk]
+            norm_sc = raw_sc / (gen_lens.unsqueeze(1) + 1).clamp(min=1)
 
-            parent_idx = [c[0] for c in candidates]
-            new_tokens = [c[1] for c in candidates]
-            new_scores = [c[2] for c in candidates]
+            flat_norm = norm_sc.flatten()
+            flat_raw = raw_sc.flatten()
+            flat_tok = top_idx.flatten()
+            flat_parent = torch.arange(b, device=t_dev).repeat_interleave(topk)
+
+            keep_n = min(beam_size, flat_norm.shape[0])
+            _, best_idx = flat_norm.topk(keep_n)
+            parent_idx = flat_parent[best_idx].tolist()
+            new_tokens = flat_tok[best_idx].tolist()
+            new_scores = flat_raw[best_idx].tolist()
             new_beam_tokens = [beam_tokens[p] + [tok] for p, tok in zip(parent_idx, new_tokens)]
 
             # Reorder/duplicate cache rows to match the new beam composition.
