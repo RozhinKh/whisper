@@ -533,13 +533,25 @@ def speculative_transcribe_beam(
             topk = min(beam_size, branch_logprobs.shape[-1])
             top_vals, top_idx = branch_logprobs.topk(topk, dim=-1)
 
+            # Rank candidates by LENGTH-NORMALIZED score, not raw cumulative
+            # logprob. Raw score systematically favors shorter continuations
+            # (every extra token adds a negative log-prob), which made the
+            # search permanently lock onto short, highly-predictable text
+            # (e.g. repeating chapter-title variants) instead of ever
+            # committing to the less uniformly-confident real narrative —
+            # length normalization is applied live, every round, not just at
+            # final beam selection (same fix Whisper's own
+            # MaximumLikelihoodRanker applies, just also needed mid-search
+            # here since pruning happens every round instead of once).
             candidates = []
             for i in range(b):
+                gen_len_i = len(beam_tokens[i]) - n_init
                 for j in range(topk):
                     tok = int(top_idx[i, j])
-                    sc = beam_scores[i] + float(top_vals[i, j])
-                    candidates.append((i, tok, sc))
-            candidates.sort(key=lambda c: c[2], reverse=True)
+                    raw_sc = beam_scores[i] + float(top_vals[i, j])
+                    norm_sc = raw_sc / max(gen_len_i + 1, 1)
+                    candidates.append((i, tok, raw_sc, norm_sc))
+            candidates.sort(key=lambda c: c[3], reverse=True)
             candidates = candidates[:beam_size]
 
             parent_idx = [c[0] for c in candidates]
