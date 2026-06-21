@@ -93,9 +93,12 @@ def main():
     parser.add_argument("--compute-type", default="float16",
                         choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Decoding temperature. 0.0 = greedy with no fallback (default). "
-                             "Whisper default uses [0.0,0.2,...,1.0] fallback ladder.")
+    parser.add_argument("--temperature", default="0.0",
+                        help="Decoding temperature. Single value like '0.0' = no fallback "
+                             "(default). Pass 'fallback' to use Whisper's actual default "
+                             "ladder (0.0,0.2,0.4,0.6,0.8,1.0), which retries a segment at "
+                             "higher temperature when compression_ratio/logprob heuristics "
+                             "flag a bad decode (e.g. a repetition hallucination loop).")
     parser.add_argument("--use-compile", action="store_true",
                         help="Compile the encoder with cudagraphs (static shape, ~4%% speedup).")
     parser.add_argument("--compile-decoder", action="store_true",
@@ -113,12 +116,17 @@ def main():
     parser.add_argument("--output", default="artemis_results.json")
     args = parser.parse_args()
 
+    if args.temperature.strip().lower() == "fallback":
+        temperature = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    else:
+        temperature = float(args.temperature)
+
     use_speculative = args.draft_model is not None
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
     print(f"Device    : {gpu_name}")
-    print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size}  temp={args.temperature})")
+    print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size}  temp={temperature})")
     if use_speculative:
         print(f"Draft     : {args.draft_model}  (speculative decoding, window={args.spec_window})")
     print(f"Dataset   : {args.dataset}")
@@ -201,7 +209,7 @@ def main():
                 audio_array,
                 language=args.language,
                 beam_size=args.beam_size,
-                temperature=args.temperature,
+                temperature=temperature,
                 fp16=(args.compute_type == "float16"),
             )
             if device == "cuda":
@@ -241,7 +249,7 @@ def main():
                         model, draft_model, audio_array,
                         language=args.language,
                         fp16=(args.compute_type == "float16"),
-                        temperature=args.temperature,
+                        temperature=temperature,
                         spec_window=args.spec_window,
                     )
                 else:
@@ -249,7 +257,7 @@ def main():
                         audio_array,
                         language=args.language,
                         beam_size=args.beam_size,
-                        temperature=args.temperature,
+                        temperature=temperature,
                         fp16=(args.compute_type == "float16"),
                     )
 
