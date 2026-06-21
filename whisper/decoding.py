@@ -171,6 +171,12 @@ class PyTorchInference(Inference):
 
     def rearrange_kv_cache(self, source_indices):
         if source_indices != list(range(len(source_indices))) and self.kv_cache is not None:
+            # Convert once and reuse for every layer, instead of letting
+            # entry[...][source_indices] implicitly convert the same Python
+            # list to a tensor on each of the up to 64 (32 layers x k,v)
+            # indexing calls below — same reordering, one conversion instead
+            # of dozens, every decode step beam search runs.
+            idx_t = torch.tensor(source_indices, device=self.model.device, dtype=torch.long)
             # Even indices = self-attention (batch = token batch, needs reordering
             # as beams shuffle). Odd indices = cross-attention, computed once from
             # audio features at batch=n_audio and broadcast against the larger
@@ -182,8 +188,8 @@ class PyTorchInference(Inference):
                 entry = self.kv_cache[idx]  # [k_or_None, v_or_None] mutable list
                 if entry[0] is not None:
                     # Update list contents in-place to preserve the list's object identity.
-                    entry[0] = entry[0][source_indices].detach()
-                    entry[1] = entry[1][source_indices].detach()
+                    entry[0] = entry[0][idx_t].detach()
+                    entry[1] = entry[1][idx_t].detach()
 
 
 class SequenceRanker:
@@ -341,6 +347,20 @@ class BeamSearchDecoder(TokenDecoder):
             self.finished_sequences = [{} for _ in range(n_audio)]
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
+
+        # Compute top-(beam_size+1) candidates and their cumulative scores for
+        # every row in one batched op, then do a SINGLE bulk transfer to CPU,
+        # instead of the original per-row, per-candidate Python loop with two
+        # .item() calls each — that was n_audio*beam_size*(beam_size+1)*2
+        # individual CPU-GPU syncs every decode step, each one stalling the
+        # GPU pipeline for a single scalar. Same scores, same math, just
+        # without re-synchronizing dozens of times to fetch them one at a time.
+        topk_vals, topk_idx = logprobs.topk(self.beam_size + 1, dim=-1)
+        new_logprobs = sum_logprobs.unsqueeze(1) + topk_vals
+        new_logprobs_list = new_logprobs.tolist()
+        topk_idx_list = topk_idx.tolist()
+        tokens_list = tokens.tolist()
+
         next_tokens, source_indices, finished_sequences = [], [], []
         for i in range(n_audio):
             scores, sources, finished = {}, {}, {}
@@ -348,11 +368,10 @@ class BeamSearchDecoder(TokenDecoder):
             # STEP 1: calculate the cumulative log probabilities for possible candidates
             for j in range(self.beam_size):
                 idx = i * self.beam_size + j
-                prefix = tokens[idx].tolist()
-                for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
-                    new_logprob = (sum_logprobs[idx] + logprob).item()
-                    sequence = tuple(prefix + [token.item()])
-                    scores[sequence] = new_logprob
+                prefix = tokens_list[idx]
+                for logprob, token in zip(new_logprobs_list[idx], topk_idx_list[idx]):
+                    sequence = tuple(prefix + [token])
+                    scores[sequence] = logprob
                     sources[sequence] = idx
 
             # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
