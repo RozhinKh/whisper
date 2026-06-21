@@ -311,20 +311,33 @@ def speculative_transcribe_beam(
     beam_size: int = 5,
     spec_window: int = _SPEC_WINDOW,
     max_new_tokens: int = 448,
+    collapse_after_rounds: int = 4,
+    fast_window: int = 5,
 ) -> dict:
     """
-    EXPERIMENTAL beam-search speculative decoding.
+    EXPERIMENTAL beam-search speculative decoding, hybrid mode.
 
-    Maintains up to `beam_size` candidate sequences simultaneously, batched
-    across the beam dimension.  Each round: the draft model proposes
-    `spec_window` tokens per beam (cheap); the target model batch-verifies
-    all beams in ONE forward pass.  All beams are truncated to the common
-    (minimum) accepted length across beams so the batch stays rectangular,
-    then branched using the target's actual top-`beam_size` log-probabilities
-    at that position (not just argmax) — this is what gives genuine beam
-    diversity, since pure greedy speculative decoding with no randomness
-    would otherwise make every beam identical.  Branching reuses logits
-    already computed in the same verification pass (no extra target call).
+    Maintains up to `beam_size` candidate sequences simultaneously (batched
+    across the beam dimension) for the first `collapse_after_rounds` rounds
+    only — this is where ambiguity actually needs resolving (e.g. choosing
+    between continuing a chapter heading vs starting the real sentence).
+    After that, the beam set collapses to the single best-scoring sequence
+    (effective beam_size=1) and `spec_window` widens to `fast_window` for
+    the remainder of the chunk, falling into the same fast, low-batch-cost
+    regime as the plain greedy path — full beam search the whole way
+    through both costs more compute per round AND needs a narrower window
+    (more frequent branch points) for the diversity to matter, which
+    together erase the entire speculative-decoding speedup advantage.
+
+    Each round: the draft model proposes `window` tokens per beam (cheap);
+    the target model batch-verifies all beams in ONE forward pass.  All
+    beams are truncated to the common (minimum) accepted length across
+    beams so the batch stays rectangular, then branched using the target's
+    actual top-k log-probabilities at that position (not just argmax) —
+    this is what gives genuine beam diversity, since pure greedy
+    speculative decoding with no randomness would otherwise make every
+    beam identical.  Branching reuses logits already computed in the same
+    verification pass (no extra target call).
 
     This is new, less-tested code relative to speculative_transcribe()'s
     greedy path — built specifically to compare against a beam_size=5
@@ -341,7 +354,8 @@ def speculative_transcribe_beam(
             if len(chunk) == 0:
                 continue
             result = speculative_transcribe_beam(
-                target, draft, chunk, language, fp16, beam_size, spec_window, max_new_tokens
+                target, draft, chunk, language, fp16, beam_size, spec_window,
+                max_new_tokens, collapse_after_rounds, fast_window,
             )
             text = result["text"].strip()
             if text:
@@ -413,11 +427,20 @@ def speculative_transcribe_beam(
         next_draft_input = [d_init[-1]] * b
 
         total_new = 0
+        round_idx = 0
         while total_new < max_new_tokens and beam_tokens:
             b = len(beam_tokens)
             cur_len = len(beam_tokens[0])
 
-            window = min(spec_window, target.dims.n_text_ctx - cur_len - 1)
+            # Diverse phase for the first collapse_after_rounds rounds (narrow
+            # window, more branch points); fast/greedy-equivalent afterward
+            # (wide window, effective_beam_size=1 forces the branch step below
+            # to keep exactly one survivor per round, same as the greedy path).
+            diverse_phase = round_idx < collapse_after_rounds
+            effective_beam_size = beam_size if diverse_phase else 1
+            cur_window = spec_window if diverse_phase else fast_window
+
+            window = min(cur_window, target.dims.n_text_ctx - cur_len - 1)
             if window <= 0:
                 # Out of context room (e.g. a repetition loop that never hits
                 # EOT naturally) — finalize whatever's left instead of
@@ -530,7 +553,7 @@ def speculative_transcribe_beam(
             branch_logits = t_log[:, common].float()
             branch_logits[:, _t_mask] = float("-inf")
             branch_logprobs = torch.log_softmax(branch_logits, dim=-1)
-            topk = min(beam_size, branch_logprobs.shape[-1])
+            topk = min(effective_beam_size, branch_logprobs.shape[-1])
             top_vals, top_idx = branch_logprobs.topk(topk, dim=-1)
 
             # Rank candidates by LENGTH-NORMALIZED score, not raw cumulative
@@ -552,7 +575,7 @@ def speculative_transcribe_beam(
                     norm_sc = raw_sc / max(gen_len_i + 1, 1)
                     candidates.append((i, tok, raw_sc, norm_sc))
             candidates.sort(key=lambda c: c[3], reverse=True)
-            candidates = candidates[:beam_size]
+            candidates = candidates[:effective_beam_size]
 
             parent_idx = [c[0] for c in candidates]
             new_tokens = [c[1] for c in candidates]
@@ -583,6 +606,7 @@ def speculative_transcribe_beam(
             beam_tokens = [new_beam_tokens[i] for i in keep_idx2]
             beam_scores = [new_scores[i] for i in keep_idx2]
             next_draft_input = [seq[-1] for seq in beam_tokens]
+            round_idx += 1
 
         for seq, sc in zip(beam_tokens, beam_scores):
             finished.append((seq, sc))
