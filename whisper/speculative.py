@@ -311,33 +311,36 @@ def speculative_transcribe_beam(
     beam_size: int = 5,
     spec_window: int = _SPEC_WINDOW,
     max_new_tokens: int = 448,
-    collapse_after_rounds: int = 4,
-    fast_window: int = 5,
+    confidence_gap_threshold: float = 1.5,
 ) -> dict:
     """
-    EXPERIMENTAL beam-search speculative decoding, hybrid mode.
+    EXPERIMENTAL beam-search speculative decoding, confidence-triggered mode.
 
-    Maintains up to `beam_size` candidate sequences simultaneously (batched
-    across the beam dimension) for the first `collapse_after_rounds` rounds
-    only — this is where ambiguity actually needs resolving (e.g. choosing
-    between continuing a chapter heading vs starting the real sentence).
-    After that, the beam set collapses to the single best-scoring sequence
-    (effective beam_size=1) and `spec_window` widens to `fast_window` for
-    the remainder of the chunk, falling into the same fast, low-batch-cost
-    regime as the plain greedy path — full beam search the whole way
-    through both costs more compute per round AND needs a narrower window
-    (more frequent branch points) for the diversity to matter, which
-    together erase the entire speculative-decoding speedup advantage.
+    Uses one fixed, generous `spec_window` throughout (no separate "fast"
+    vs "diverse" phase) — diversification is triggered by the TARGET
+    MODEL'S OWN CONFIDENCE, not a fixed round count or window size.  Every
+    round already computes target logits at every position in the window
+    (the verify pass), so checking the top-1 vs top-2 log-prob gap at each
+    position is free (no extra forward pass).  If every position from the
+    pending token through `common` shows a confident (large-gap) top
+    choice, the round behaves exactly like greedy speculative decoding
+    (topk=1, full window, no extra batch cost).  The first position with a
+    gap below `confidence_gap_threshold` triggers branching at exactly that
+    position with the full `beam_size`, since that's where the model is
+    genuinely unsure between alternatives (e.g. continuing a chapter
+    heading vs starting the real sentence) — fixed-cadence branching
+    (every N rounds, or a narrow window every round) pays this cost
+    everywhere, even during long confident stretches of narrative; this
+    only pays it where the model's own logits say it's warranted.
 
-    Each round: the draft model proposes `window` tokens per beam (cheap);
-    the target model batch-verifies all beams in ONE forward pass.  All
-    beams are truncated to the common (minimum) accepted length across
-    beams so the batch stays rectangular, then branched using the target's
-    actual top-k log-probabilities at that position (not just argmax) —
-    this is what gives genuine beam diversity, since pure greedy
-    speculative decoding with no randomness would otherwise make every
-    beam identical.  Branching reuses logits already computed in the same
-    verification pass (no extra target call).
+    Each round: the draft model proposes `spec_window` tokens per beam
+    (cheap); the target model batch-verifies all beams in ONE forward pass.
+    All beams are truncated to the common (minimum) accepted length across
+    beams so the batch stays rectangular, then branched at the
+    confidence-triggered position using the target's actual top-k
+    log-probabilities there (not just argmax) — this is what gives genuine
+    beam diversity, since pure greedy speculative decoding with no
+    randomness would otherwise make every beam identical.
 
     This is new, less-tested code relative to speculative_transcribe()'s
     greedy path — built specifically to compare against a beam_size=5
@@ -355,7 +358,7 @@ def speculative_transcribe_beam(
                 continue
             result = speculative_transcribe_beam(
                 target, draft, chunk, language, fp16, beam_size, spec_window,
-                max_new_tokens, collapse_after_rounds, fast_window,
+                max_new_tokens, confidence_gap_threshold,
             )
             text = result["text"].strip()
             if text:
@@ -427,20 +430,11 @@ def speculative_transcribe_beam(
         next_draft_input = [d_init[-1]] * b
 
         total_new = 0
-        round_idx = 0
         while total_new < max_new_tokens and beam_tokens:
             b = len(beam_tokens)
             cur_len = len(beam_tokens[0])
 
-            # Diverse phase for the first collapse_after_rounds rounds (narrow
-            # window, more branch points); fast/greedy-equivalent afterward
-            # (wide window, effective_beam_size=1 forces the branch step below
-            # to keep exactly one survivor per round, same as the greedy path).
-            diverse_phase = round_idx < collapse_after_rounds
-            effective_beam_size = beam_size if diverse_phase else 1
-            cur_window = spec_window if diverse_phase else fast_window
-
-            window = min(cur_window, target.dims.n_text_ctx - cur_len - 1)
+            window = min(spec_window, target.dims.n_text_ctx - cur_len - 1)
             if window <= 0:
                 # Out of context room (e.g. a repetition loop that never hits
                 # EOT naturally) — finalize whatever's left instead of
@@ -495,39 +489,64 @@ def speculative_transcribe_beam(
 
             common = min(accept_counts)
 
-            # If every beam fully accepted its window, draft's cache is one
-            # token short: the draft loop never feeds its own last proposal
-            # back in (same reasoning as the greedy path's "bonus" catch-up
-            # call), so it needs an explicit advance here before truncation.
-            if common == k:
+            # Scan positions 0..common (inclusive) for the EARLIEST position
+            # where the target shows genuine uncertainty (small top-1 vs
+            # top-2 logit gap, checked across all beams) — reusing logits
+            # already computed by the verify call above, so this is free.
+            # If found, branch there with full beam_size (real diversity,
+            # justified by the model's own signal). If every position up to
+            # and including `common` is confident, branch_pos=common and we
+            # branch with topk=1 — identical cost profile to the greedy
+            # path; no wasted exploration on confident narrative stretches.
+            branch_pos = common
+            ambiguous = False
+            for pos in range(common + 1):
+                for i in range(b):
+                    logits = t_log[i, pos].float()
+                    logits[_t_mask] = float("-inf")
+                    top2_vals = torch.topk(logits, 2).values
+                    gap = float(top2_vals[0] - top2_vals[1])
+                    if gap < confidence_gap_threshold:
+                        branch_pos = pos
+                        ambiguous = True
+                        break
+                if ambiguous:
+                    break
+
+            # If every beam fully accepted its window AND no early ambiguity
+            # was found (branch_pos == k), draft's cache is one token short:
+            # the draft loop never feeds its own last proposal back in (same
+            # reasoning as the greedy path's "bonus" catch-up call), so it
+            # needs an explicit advance here before truncation.
+            if branch_pos == k:
                 last_prop = torch.tensor(
-                    [[proposals[i][common - 1]] for i in range(b)], device=d_dev, dtype=torch.long
+                    [[proposals[i][branch_pos - 1]] for i in range(b)], device=d_dev, dtype=torch.long
                 )
                 draft.decoder(last_prop, d_feat, kv_cache=d_cache)
 
-            # Truncate caches to the common accepted length so the batch
-            # stays rectangular for the next round.  cur_len already counts
-            # the old pending token (about to be confirmed by this verify
-            # call), so the post-accept cache length is cur_len + common —
-            # NOT cur_len - 1 + common, which would drop the last accepted
+            # Truncate caches to the branch-point length so the batch stays
+            # rectangular for the next round.  cur_len already counts the
+            # old pending token (about to be confirmed by this verify call),
+            # so the post-accept cache length is cur_len + branch_pos — NOT
+            # cur_len - 1 + branch_pos, which would drop the last accepted
             # proposal's real KV entry instead of just the new pending token.
-            common_cache_len = cur_len + common
-            _truncate_kv(t_cache, common_cache_len)
-            _truncate_kv(d_cache, common_cache_len)
+            branch_cache_len = cur_len + branch_pos
+            _truncate_kv(t_cache, branch_cache_len)
+            _truncate_kv(d_cache, branch_cache_len)
 
-            common_logprobs = [0.0] * b
+            branch_logprobs_accum = [0.0] * b
             for i in range(b):
                 lp = 0.0
-                for pos in range(common):
+                for pos in range(branch_pos):
                     logits = t_log[i, pos].float()
                     logits[_t_mask] = float("-inf")
                     lp += float(torch.log_softmax(logits, dim=-1)[proposals[i][pos]])
-                common_logprobs[i] = lp
+                branch_logprobs_accum[i] = lp
 
             for i in range(b):
-                beam_tokens[i] = beam_tokens[i] + proposals[i][:common]
-                beam_scores[i] = beam_scores[i] + common_logprobs[i]
-            total_new += common
+                beam_tokens[i] = beam_tokens[i] + proposals[i][:branch_pos]
+                beam_scores[i] = beam_scores[i] + branch_logprobs_accum[i]
+            total_new += branch_pos
 
             # Split off any beams that ended in EOT within the common-accepted
             # prefix before branching (branching from a finished beam is
@@ -547,13 +566,15 @@ def speculative_transcribe_beam(
                 b = len(keep_idx)
 
             # ── BRANCH: expand each surviving beam using the target's actual
-            # top-`beam_size` log-probs at position `common` (already computed
-            # in this same verify pass — no extra target call needed), then
-            # prune the global candidate pool to top `beam_size`. ───────────
-            branch_logits = t_log[:, common].float()
+            # top-k log-probs at `branch_pos` (already computed in this same
+            # verify pass — no extra target call needed).  topk=beam_size
+            # only when genuine ambiguity was detected above; otherwise
+            # topk=1, which costs the same as plain greedy decoding. ───────
+            branch_logits = t_log[:, branch_pos].float()
             branch_logits[:, _t_mask] = float("-inf")
             branch_logprobs = torch.log_softmax(branch_logits, dim=-1)
-            topk = min(effective_beam_size, branch_logprobs.shape[-1])
+            cur_beam_size = beam_size if ambiguous else 1
+            topk = min(cur_beam_size, branch_logprobs.shape[-1])
             top_vals, top_idx = branch_logprobs.topk(topk, dim=-1)
 
             # Rank candidates by LENGTH-NORMALIZED score, not raw cumulative
@@ -575,7 +596,7 @@ def speculative_transcribe_beam(
                     norm_sc = raw_sc / max(gen_len_i + 1, 1)
                     candidates.append((i, tok, raw_sc, norm_sc))
             candidates.sort(key=lambda c: c[3], reverse=True)
-            candidates = candidates[:effective_beam_size]
+            candidates = candidates[:cur_beam_size]
 
             parent_idx = [c[0] for c in candidates]
             new_tokens = [c[1] for c in candidates]
@@ -606,7 +627,6 @@ def speculative_transcribe_beam(
             beam_tokens = [new_beam_tokens[i] for i in keep_idx2]
             beam_scores = [new_scores[i] for i in keep_idx2]
             next_draft_input = [seq[-1] for seq in beam_tokens]
-            round_idx += 1
 
         for seq, sc in zip(beam_tokens, beam_scores):
             finished.append((seq, sc))
