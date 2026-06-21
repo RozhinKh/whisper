@@ -8,8 +8,7 @@ Usage:
         --audio-dir   /path/to/audio_files \
         --output      results_sequential.json \
         [--compute-type float16] \
-        [--beam-size 5] \
-        [--use-compile]
+        [--beam-size 5]
 """
 
 import argparse
@@ -54,36 +53,16 @@ def main():
     parser.add_argument("--beam-size", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="Decoding temperature. 0.0 = greedy with no fallback (default).")
-    parser.add_argument("--use-compile", action="store_true")
-    parser.add_argument("--draft-model", default=None,
-                        help="Enable speculative decoding with this draft model (e.g. 'base').")
-    parser.add_argument("--spec-window", type=int, default=5)
     args = parser.parse_args()
-    use_speculative = args.draft_model is not None
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device     : {torch.cuda.get_device_name(0) if device == 'cuda' else 'CPU'}")
     print(f"Model      : large-v3")
     print(f"Compute    : {args.compute_type}")
     print(f"Beam size  : {args.beam_size}")
-    print(f"Compile    : {args.use_compile}")
-    if use_speculative:
-        print(f"Draft      : {args.draft_model}  (speculative decoding, window={args.spec_window})")
     print()
 
     model = whisper.load_model("large-v3")
-    if use_speculative:
-        from whisper.speculative import speculative_transcribe
-        draft_model = whisper.load_model(args.draft_model)
-        print(f"Draft model loaded: {args.draft_model}")
-
-    if args.use_compile and device == "cuda":
-        print("Compiling encoder with torch.compile (cudagraphs) …")
-        try:
-            model.encoder = torch.compile(model.encoder, backend="cudagraphs")
-            print("  Encoder compiled.")
-        except Exception as e:
-            print(f"  Encoder compile failed ({e}); running uncompiled.")
 
     manifest = load_artemis_manifest(args.artemis_dir)
     if manifest is None:
@@ -114,20 +93,12 @@ def main():
         torch.cuda.synchronize() if device == "cuda" else None
         t0 = time.perf_counter()
 
-        if use_speculative:
-            audio_array = whisper.audio.load_audio(audio_path)
-            result = speculative_transcribe(
-                model, draft_model, audio_array,
-                fp16=(args.compute_type == "float16"),
-                temperature=args.temperature,
-                spec_window=args.spec_window,
-            )
-        else:
-            result = model.transcribe(
-                audio_path,
-                beam_size=args.beam_size,
-                fp16=(args.compute_type == "float16"),
-            )
+        result = model.transcribe(
+            audio_path,
+            beam_size=args.beam_size,
+            temperature=args.temperature,
+            fp16=(args.compute_type == "float16"),
+        )
 
         torch.cuda.synchronize() if device == "cuda" else None
         elapsed = time.perf_counter() - t0
@@ -157,8 +128,6 @@ def main():
             "model": "large-v3",
             "compute_type": args.compute_type,
             "beam_size": args.beam_size,
-            "use_compile": args.use_compile,
-            "draft_model": args.draft_model,
             "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
         },
         "total_audio_s": total_audio_s,

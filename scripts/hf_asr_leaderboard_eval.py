@@ -99,19 +99,6 @@ def main():
                              "ladder (0.0,0.2,0.4,0.6,0.8,1.0), which retries a segment at "
                              "higher temperature when compression_ratio/logprob heuristics "
                              "flag a bad decode (e.g. a repetition hallucination loop).")
-    parser.add_argument("--use-compile", action="store_true",
-                        help="Compile the encoder with cudagraphs (static shape, ~4%% speedup).")
-    parser.add_argument("--compile-decoder", action="store_true",
-                        help="Compile the target decoder with torch.compile(dynamic=True). "
-                             "Eliminates Python overhead across all 32 decoder layers. "
-                             "Requires the hook-free KV cache (used automatically by "
-                             "speculative_transcribe). First sample triggers compilation warmup.")
-    parser.add_argument("--draft-model", default=None,
-                        help="Enable speculative decoding with this draft model (e.g. 'tiny').")
-    parser.add_argument("--spec-window", type=int, default=5,
-                        help="Number of tokens the draft model proposes per round (default 5). "
-                             "Smaller values reduce float16 batch-vs-sequential divergence at "
-                             "the cost of slightly less speedup.")
     parser.add_argument("--language", default="en")
     parser.add_argument("--output", default="artemis_results.json")
     args = parser.parse_args()
@@ -121,52 +108,14 @@ def main():
     else:
         temperature = float(args.temperature)
 
-    use_speculative = args.draft_model is not None
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
     print(f"Device    : {gpu_name}")
     print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size}  temp={temperature})")
-    if use_speculative:
-        print(f"Draft     : {args.draft_model}  (speculative decoding, window={args.spec_window})")
     print(f"Dataset   : {args.dataset}")
     print()
 
     model = whisper.load_model(args.model)
-    if use_speculative:
-        from whisper.speculative import speculative_transcribe
-        draft_model = whisper.load_model(args.draft_model)
-        print(f"Draft model loaded: {args.draft_model}")
-
-    if args.use_compile and torch.cuda.is_available():
-        print("Compiling encoder with torch.compile (cudagraphs) …")
-        # Encoder input is always [1, n_mels, 3000] — fixed shape.
-        # cudagraphs captures the full kernel sequence once and replays it,
-        # eliminating all CUDA kernel launch overhead for 32 encoder layers.
-        try:
-            model.encoder = torch.compile(model.encoder, backend="cudagraphs")
-            print("  Encoder compiled.")
-        except Exception as e:
-            print(f"  Encoder compile failed ({e}); running uncompiled.")
-
-    if args.compile_decoder and torch.cuda.is_available():
-        import os
-        os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
-        print("Compiling target decoder with torch.compile (inductor, dynamic=True) …")
-        # The hook-free int-indexed KV cache (make_kv_cache) gives a fixed dict
-        # structure across all calls. Combined with dynamic=True, dynamo compiles
-        # exactly two specializations (first call with all-None cache, subsequent
-        # calls with all-(k,v)-tuple cache at variable lengths) and never hits the
-        # cache_size_limit. Speedup: fused GEMM + attention, reduced Python dispatch.
-        try:
-            model.decoder = torch.compile(
-                model.decoder,
-                backend="inductor",
-                dynamic=True,
-            )
-            print("  Decoder compiled.")
-        except Exception as e:
-            print(f"  Decoder compile failed ({e}); running uncompiled.")
 
     normalizer = EnglishTextNormalizer()
     cfg = DATASET_CONFIGS[args.dataset]
@@ -244,22 +193,13 @@ def main():
                     torch.cuda.synchronize()
                 t0 = time.perf_counter()
 
-                if use_speculative:
-                    result = speculative_transcribe(
-                        model, draft_model, audio_array,
-                        language=args.language,
-                        fp16=(args.compute_type == "float16"),
-                        temperature=temperature,
-                        spec_window=args.spec_window,
-                    )
-                else:
-                    result = model.transcribe(
-                        audio_array,
-                        language=args.language,
-                        beam_size=args.beam_size,
-                        temperature=temperature,
-                        fp16=(args.compute_type == "float16"),
-                    )
+                result = model.transcribe(
+                    audio_array,
+                    language=args.language,
+                    beam_size=args.beam_size,
+                    temperature=temperature,
+                    fp16=(args.compute_type == "float16"),
+                )
 
                 if device == "cuda":
                     torch.cuda.synchronize()
