@@ -484,33 +484,48 @@ class ApplyTimestampRules(LogitFilter):
             logits[:, self.tokenizer.no_timestamps] = -np.inf
 
         # timestamps have to appear in pairs, except directly before EOT; mask logits accordingly
-        for k in range(tokens.shape[0]):
-            sampled_tokens = tokens[k, self.sample_begin :]
-            seq = [t for t in sampled_tokens.tolist()]
-            last_was_timestamp = (
-                len(seq) >= 1 and seq[-1] >= self.tokenizer.timestamp_begin
-            )
-            penultimate_was_timestamp = (
-                len(seq) < 2 or seq[-2] >= self.tokenizer.timestamp_begin
+        n_batch = tokens.shape[0]
+        sampled = tokens[:, self.sample_begin :]
+        seq_len = sampled.shape[1]
+        device = tokens.device
+
+        if seq_len >= 1:
+            last_was_timestamp = sampled[:, -1] >= self.tokenizer.timestamp_begin
+        else:
+            last_was_timestamp = torch.zeros(n_batch, dtype=torch.bool, device=device)
+
+        if seq_len >= 2:
+            penultimate_was_timestamp = sampled[:, -2] >= self.tokenizer.timestamp_begin
+        else:
+            penultimate_was_timestamp = torch.ones(n_batch, dtype=torch.bool, device=device)
+
+        mask_no_timestamp = last_was_timestamp & penultimate_was_timestamp
+        logits[mask_no_timestamp, self.tokenizer.timestamp_begin :] = -np.inf
+        mask_no_text = last_was_timestamp & ~penultimate_was_timestamp
+        logits[mask_no_text, : self.tokenizer.eot] = -np.inf
+
+        # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
+        # also force each segment to have a nonzero length, to prevent infinite looping
+        is_timestamp = sampled.ge(self.tokenizer.timestamp_begin)
+        has_any_timestamp = is_timestamp.any(dim=1)
+        if has_any_timestamp.any():
+            position = torch.arange(seq_len, device=device).unsqueeze(0).expand(n_batch, -1)
+            last_ts_pos = torch.where(
+                is_timestamp, position, torch.full_like(position, -1)
+            ).max(dim=1).values
+            safe_pos = last_ts_pos.clamp(min=0)
+            timestamp_last = sampled.gather(1, safe_pos.unsqueeze(1)).squeeze(1)
+            no_increment = last_was_timestamp & ~penultimate_was_timestamp
+            timestamp_last = torch.where(
+                no_increment, timestamp_last, timestamp_last + 1
             )
 
-            if last_was_timestamp:
-                if penultimate_was_timestamp:  # has to be non-timestamp
-                    logits[k, self.tokenizer.timestamp_begin :] = -np.inf
-                else:  # cannot be normal text tokens
-                    logits[k, : self.tokenizer.eot] = -np.inf
-
-            timestamps = sampled_tokens[
-                sampled_tokens.ge(self.tokenizer.timestamp_begin)
-            ]
-            if timestamps.numel() > 0:
-                # timestamps shouldn't decrease; forbid timestamp tokens smaller than the last
-                # also force each segment to have a nonzero length, to prevent infinite looping
-                if last_was_timestamp and not penultimate_was_timestamp:
-                    timestamp_last = timestamps[-1]
-                else:
-                    timestamp_last = timestamps[-1] + 1
-                logits[k, self.tokenizer.timestamp_begin : timestamp_last] = -np.inf
+            ts_vocab = torch.arange(
+                self.tokenizer.timestamp_begin, logits.shape[-1], device=device
+            ).unsqueeze(0)
+            suppress = (ts_vocab < timestamp_last.unsqueeze(1)) & has_any_timestamp.unsqueeze(1)
+            ts_logits_view = logits[:, self.tokenizer.timestamp_begin :]
+            ts_logits_view[suppress] = -np.inf
 
         if tokens.shape[1] == self.sample_begin:
             # suppress generating non-timestamp tokens at the beginning
@@ -525,13 +540,10 @@ class ApplyTimestampRules(LogitFilter):
 
         # if sum of probability over timestamps is above any other token, sample timestamp
         logprobs = F.log_softmax(logits.float(), dim=-1)
-        for k in range(tokens.shape[0]):
-            timestamp_logprob = logprobs[k, self.tokenizer.timestamp_begin :].logsumexp(
-                dim=-1
-            )
-            max_text_token_logprob = logprobs[k, : self.tokenizer.timestamp_begin].max()
-            if timestamp_logprob > max_text_token_logprob:
-                logits[k, : self.tokenizer.timestamp_begin] = -np.inf
+        timestamp_logprob = logprobs[:, self.tokenizer.timestamp_begin :].logsumexp(dim=-1)
+        max_text_token_logprob = logprobs[:, : self.tokenizer.timestamp_begin].max(dim=-1).values
+        suppress_text = timestamp_logprob > max_text_token_logprob
+        logits[suppress_text, : self.tokenizer.timestamp_begin] = -np.inf
 
 
 class DecodingTask:
