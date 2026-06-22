@@ -86,4 +86,9 @@ def health():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=args.port, threaded=True)
+    # threaded=False: this server holds one shared model instance. Whisper's
+    # KV cache (hook-based on main, hook-free dict on this branch) is not
+    # safe for concurrent requests against the same model object -- enabling
+    # threading caused intermittent cache corruption ("Key and Value must
+    # have the same sequence length") under back-to-back sequential requests.
+    app.run(host="0.0.0.0", port=args.port, threaded=False)
