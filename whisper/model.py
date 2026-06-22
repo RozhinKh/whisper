@@ -171,6 +171,16 @@ class MultiHeadAttention(nn.Module):
             # scaled_dot_product_attention auto-selects Flash Attention on Ampere
             # when inputs are fp16/bf16 and head_dim <= 128. The sdp_kernel
             # context manager is not traceable by torch.compile(fullgraph=True).
+            if k.shape[0] == 1 and q.shape[0] != 1:
+                # Cross-attention cache is computed once per audio file (batch=1)
+                # and broadcasts against the beam-expanded query batch. Flash and
+                # memory-efficient SDPA kernels reject batch broadcasting outright
+                # ("both fused kernels require query, key and value to have the
+                # same batch_size") and silently fall back to the much slower
+                # unfused "math" kernel. Pre-expanding is a stride-0 view (no
+                # copy) that makes the batch dims equal so flash attention runs.
+                k = k.expand(q.shape[0], *k.shape[1:])
+                v = v.expand(q.shape[0], *v.shape[1:])
             a = scaled_dot_product_attention(
                 q, k, v, is_causal=mask is not None and n_ctx > 1
             )
