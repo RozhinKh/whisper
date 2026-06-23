@@ -23,6 +23,7 @@ Usage:
 import argparse
 import os
 import tempfile
+import threading
 
 from flask import Flask, request, jsonify
 
@@ -48,16 +49,24 @@ print(f"Model ready. Listening on port {args.port} ...")
 
 app = Flask(__name__)
 
+# Concurrent HTTP connections (multipart upload parsing, etc.) are safe and
+# need real threading -- Flask's threaded=False serializes the whole request,
+# which corrupted simultaneous large-file uploads under concurrent load. Only
+# the actual model call needs to be serialized, since the KV cache is not
+# safe for concurrent access against the same shared model instance.
+_inference_lock = threading.Lock()
+
 
 def _transcribe(tmp_path: str, language):
     lang = language or args.language or "en"
-    result = _model.transcribe(
-        tmp_path,
-        language=lang,
-        beam_size=args.beam_size,
-        temperature=args.temperature,
-        fp16=(args.compute_type == "float16"),
-    )
+    with _inference_lock:
+        result = _model.transcribe(
+            tmp_path,
+            language=lang,
+            beam_size=args.beam_size,
+            temperature=args.temperature,
+            fp16=(args.compute_type == "float16"),
+        )
     return result["text"].strip()
 
 
@@ -86,9 +95,10 @@ def health():
 
 
 if __name__ == "__main__":
-    # threaded=False: this server holds one shared model instance. Whisper's
-    # KV cache (hook-based on main, hook-free dict on this branch) is not
-    # safe for concurrent requests against the same model object -- enabling
-    # threading caused intermittent cache corruption ("Key and Value must
-    # have the same sequence length") under back-to-back sequential requests.
-    app.run(host="0.0.0.0", port=args.port, threaded=False)
+    # threaded=True + _inference_lock (above): lets Flask handle concurrent
+    # HTTP connections/uploads correctly (threaded=False corrupted
+    # simultaneous large multipart uploads under concurrent benchmark load),
+    # while the lock still serializes access to the shared model instance to
+    # prevent KV cache corruption ("Key and Value must have the same sequence
+    # length") that threaded=True caused on its own.
+    app.run(host="0.0.0.0", port=args.port, threaded=True)
