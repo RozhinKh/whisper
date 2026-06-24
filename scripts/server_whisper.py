@@ -38,6 +38,11 @@ parser.add_argument("--device", default="cuda")
 parser.add_argument("--language", default=None,
                      help="Force language (e.g. 'en'). Default: auto-detect.")
 parser.add_argument("--port", type=int, default=8001)
+parser.add_argument("--no-inference-lock", action="store_true",
+                     help="Disable the inference lock. Only safe for the hook-free KV "
+                          "cache implementation (this branch) at temperature=0.0 -- the "
+                          "original hook-based cache (main branch) corrupts under "
+                          "concurrent access without this lock.")
 args = parser.parse_args()
 
 print(f"Loading model: {args.model}  compute={args.compute_type}  "
@@ -51,22 +56,32 @@ app = Flask(__name__)
 
 # Concurrent HTTP connections (multipart upload parsing, etc.) are safe and
 # need real threading -- Flask's threaded=False serializes the whole request,
-# which corrupted simultaneous large-file uploads under concurrent load. Only
-# the actual model call needs to be serialized, since the KV cache is not
-# safe for concurrent access against the same shared model instance.
+# which corrupted simultaneous large-file uploads under concurrent load.
+#
+# The inference lock below guards the actual model call. It's required for
+# the original hook-based KV cache (hooks attach to shared model layers,
+# so concurrent calls can write into each other's cache). The hook-free KV
+# cache on this branch passes the cache as a per-call argument instead, with
+# no shared mutable state on the model layers themselves -- so it may not
+# need this lock at all. --no-inference-lock tests that hypothesis; verify
+# output correctness before trusting any speed numbers collected with it.
 _inference_lock = threading.Lock()
+_use_lock = not args.no_inference_lock
 
 
 def _transcribe(tmp_path: str, language):
     lang = language or args.language or "en"
-    with _inference_lock:
-        result = _model.transcribe(
-            tmp_path,
-            language=lang,
-            beam_size=args.beam_size,
-            temperature=args.temperature,
-            fp16=(args.compute_type == "float16"),
-        )
+    kwargs = dict(
+        language=lang,
+        beam_size=args.beam_size,
+        temperature=args.temperature,
+        fp16=(args.compute_type == "float16"),
+    )
+    if _use_lock:
+        with _inference_lock:
+            result = _model.transcribe(tmp_path, **kwargs)
+    else:
+        result = _model.transcribe(tmp_path, **kwargs)
     return result["text"].strip()
 
 
