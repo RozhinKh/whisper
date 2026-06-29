@@ -1,0 +1,25 @@
+{
+  "endpoint": "http://localhost:8008",
+  "model": "whisper-large-v3",
+  "validity_passed": true,
+  "sequential": {},
+  "validity": {},
+  "workload": {
+    "telephone_v1": {
+      "requests": 5,
+      "successful": 5,
+      "errors": 0,
+      "metrics": {
+        "mean_rtf": 0.1656785374195674,
+        "p50_rtf": 0.1652293969906415,
+        "p95_rtf": 0.16950572717475648,
+        "p99_rtf": 0.16950572717475648,
+        "mean_latency_ms": 210802.90954969823,
+        "p50_latency_ms": 210231.44078440964,
+        "p95_latency_ms": 215672.47653380036,
+        "p99_latency_ms": 215672.47653380036,
+        "cv_percent": 1.2853578912419767
+      }
+    }
+  }
+}
