@@ -145,16 +145,19 @@ class PyTorchInference(Inference):
     def __init__(self, model: "Whisper", initial_token_length: int):
         self.model: "Whisper" = model
         self.initial_token_length = initial_token_length
-        self.kv_cache = {}
-        self.hooks = []
+        self.kv_cache: Optional[dict] = None
+        self.hooks: list = []  # kept for API compat; always empty with hook-free path
 
         key_modules = [block.attn.key for block in self.model.decoder.blocks]
         value_modules = [block.attn.value for block in self.model.decoder.blocks]
         self.kv_modules = key_modules + value_modules
 
     def logits(self, tokens: Tensor, audio_features: Tensor) -> Tensor:
-        if not self.kv_cache:
-            self.kv_cache, self.hooks = self.model.install_kv_cache_hooks()
+        if self.kv_cache is None:
+            # Pre-populate with [None, None] sentinels so the dict structure is
+            # stable across all calls. torch.compile guards on structure, not on
+            # None vs Tensor values, preventing cache-limit recompilation.
+            self.kv_cache = self.model.make_kv_cache()
 
         if tokens.shape[-1] > self.initial_token_length:
             # only need to use the last token except in the first forward pass
@@ -166,14 +169,23 @@ class PyTorchInference(Inference):
         for hook in self.hooks:
             hook.remove()
 
-        self.kv_cache = {}
+        self.kv_cache = None
         self.hooks = []
 
     def rearrange_kv_cache(self, source_indices):
-        if source_indices != list(range(len(source_indices))):
-            for module in self.kv_modules:
-                # update the key/value cache to contain the selected sequences
-                self.kv_cache[module] = self.kv_cache[module][source_indices].detach()
+        if source_indices != list(range(len(source_indices))) and self.kv_cache is not None:
+            # Convert once and reuse for every layer, instead of implicitly
+            # converting the same Python list to a tensor on each indexing call.
+            idx_t = torch.tensor(source_indices, device=self.model.device, dtype=torch.long)
+            # Even indices = self-attention (must be reordered as beams shuffle).
+            # Odd indices = cross-attention (computed once at batch=n_audio and
+            # broadcast in SDPA — indexing with beam-length indices goes out of
+            # bounds, so skip them, matching the original hook-based behavior).
+            for idx in range(0, self.model.decoder._n_kv_entries, 2):
+                entry = self.kv_cache[idx]  # [k_or_None, v_or_None] mutable list
+                if entry[0] is not None:
+                    entry[0] = entry[0][idx_t].detach()
+                    entry[1] = entry[1][idx_t].detach()
 
 
 class SequenceRanker:
@@ -331,6 +343,17 @@ class BeamSearchDecoder(TokenDecoder):
             self.finished_sequences = [{} for _ in range(n_audio)]
 
         logprobs = F.log_softmax(logits.float(), dim=-1)
+
+        # Compute top-(beam_size+1) candidates for every row in one batched op,
+        # then do a single bulk .tolist() transfer instead of the original loop
+        # with two .item() calls per candidate — that was n_audio*beam_size*
+        # (beam_size+1)*2 individual CPU-GPU syncs every decode step.
+        topk_vals, topk_idx = logprobs.topk(self.beam_size + 1, dim=-1)
+        new_logprobs = sum_logprobs.unsqueeze(1) + topk_vals
+        new_logprobs_list = new_logprobs.tolist()
+        topk_idx_list = topk_idx.tolist()
+        tokens_list = tokens.tolist()
+
         next_tokens, source_indices, finished_sequences = [], [], []
         for i in range(n_audio):
             scores, sources, finished = {}, {}, {}
@@ -338,11 +361,10 @@ class BeamSearchDecoder(TokenDecoder):
             # STEP 1: calculate the cumulative log probabilities for possible candidates
             for j in range(self.beam_size):
                 idx = i * self.beam_size + j
-                prefix = tokens[idx].tolist()
-                for logprob, token in zip(*logprobs[idx].topk(self.beam_size + 1)):
-                    new_logprob = (sum_logprobs[idx] + logprob).item()
-                    sequence = tuple(prefix + [token.item()])
-                    scores[sequence] = new_logprob
+                prefix = tokens_list[idx]
+                for logprob, token in zip(new_logprobs_list[idx], topk_idx_list[idx]):
+                    sequence = tuple(prefix + [token])
+                    scores[sequence] = logprob
                     sources[sequence] = idx
 
             # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
