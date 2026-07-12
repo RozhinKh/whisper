@@ -121,6 +121,18 @@ class MultiHeadAttention(nn.Module):
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
 
         if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa:
+            if k.shape[0] == 1 and q.shape[0] != 1:
+                # Cross-attention: k/v are computed once per audio segment at
+                # batch=n_audio, while q is expanded to batch=n_audio*beam_size
+                # for beam search.  PyTorch's flash and memory-efficient SDPA
+                # kernels require identical batch sizes on q, k, and v and
+                # silently fall back to the unfused math kernel when they
+                # differ — with no warning and a significant speed penalty.
+                # Expanding k/v to match q's batch size is a zero-copy
+                # stride-0 view (.expand does not allocate) and allows the
+                # fast kernel to run on every cross-attention call.
+                k = k.expand(q.shape[0], *k.shape[1:])
+                v = v.expand(q.shape[0], *v.shape[1:])
             a = scaled_dot_product_attention(
                 q, k, v, is_causal=mask is not None and n_ctx > 1
             )
