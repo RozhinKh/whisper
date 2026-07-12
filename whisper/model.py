@@ -13,6 +13,16 @@ from .decoding import decode as decode_function
 from .decoding import detect_language as detect_language_function
 from .transcribe import transcribe as transcribe_function
 
+# ── RTX 3090 (Ampere) global backend settings ─────────────────────────────────
+# TF32 for matmul only (linear layers): tensor-core throughput with minimal
+# precision impact. cudnn TF32 is disabled to keep conv/beam-search WER stable.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+torch.backends.cudnn.benchmark = True
+# ──────────────────────────────────────────────────────────────────────────────
+
 try:
     from torch.nn.functional import scaled_dot_product_attention
 
@@ -20,6 +30,7 @@ try:
 except (ImportError, RuntimeError, OSError):
     scaled_dot_product_attention = None
     SDPA_AVAILABLE = False
+
 
 
 @dataclass
@@ -88,6 +99,11 @@ class MultiHeadAttention(nn.Module):
         self.key = Linear(n_state, n_state, bias=False)
         self.value = Linear(n_state, n_state)
         self.out = Linear(n_state, n_state)
+        # Precompute attention scale once to avoid pow/sqrt at every forward call.
+        self.scale = (n_state // n_head) ** -0.25
+        # Assigned by TextDecoder.__init__ to enable hook-free int-indexed KV caching.
+        # When None, the legacy hook-based path is used.
+        self._kv_idx: Optional[int] = None
 
     def forward(
         self,
@@ -98,15 +114,46 @@ class MultiHeadAttention(nn.Module):
     ):
         q = self.query(x)
 
-        if kv_cache is None or xa is None or self.key not in kv_cache:
-            # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
-            # otherwise, perform key/value projections for self- or cross-attention as usual.
+        if kv_cache is None:
             k = self.key(x if xa is None else xa)
             v = self.value(x if xa is None else xa)
+        elif self._kv_idx is not None:
+            # Hook-free path: KV accumulation happens here, not via register_forward_hook.
+            # Cache entries are mutable lists [k_or_None, v_or_None].  Using lists
+            # (not tuples) keeps the same Python object in kv_cache[idx] across all
+            # calls — only list[0]/[1] change.  dynamo guards on ___check_obj_id of
+            # the *list*, which is stable, so there are no cache_size_limit storms.
+            idx = self._kv_idx
+            entry = kv_cache[idx]  # always the same list object
+            if xa is not None:
+                # Cross-attention: compute K, V from audio once, then reuse.
+                if entry[0] is None:
+                    k = self.key(xa)
+                    v = self.value(xa)
+                    entry[0] = k
+                    entry[1] = v
+                else:
+                    k = entry[0]
+                    v = entry[1]
+            else:
+                # Self-attention: cat new K, V with accumulated cache.
+                new_k = self.key(x)
+                new_v = self.value(x)
+                if entry[0] is None:
+                    k, v = new_k, new_v
+                else:
+                    k = torch.cat([entry[0], new_k], dim=1)
+                    v = torch.cat([entry[1], new_v], dim=1)
+                entry[0] = k
+                entry[1] = v
         else:
-            # for cross-attention, calculate keys and values once and reuse in subsequent calls.
-            k = kv_cache[self.key]
-            v = kv_cache[self.value]
+            # Legacy hook-based path: K, V already accumulated by register_forward_hook.
+            if xa is None or self.key not in kv_cache:
+                k = self.key(x if xa is None else xa)
+                v = self.value(x if xa is None else xa)
+            else:
+                k = kv_cache[self.key]
+                v = kv_cache[self.value]
 
         wv, qk = self.qkv_attention(q, k, v, mask)
         return self.out(wv), qk
@@ -115,12 +162,25 @@ class MultiHeadAttention(nn.Module):
         self, q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         n_batch, n_ctx, n_state = q.shape
-        scale = (n_state // self.n_head) ** -0.25
+        scale = self.scale
         q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
 
         if SDPA_AVAILABLE and MultiHeadAttention.use_sdpa:
+            # scaled_dot_product_attention auto-selects Flash Attention on Ampere
+            # when inputs are fp16/bf16 and head_dim <= 128. The sdp_kernel
+            # context manager is not traceable by torch.compile(fullgraph=True).
+            if k.shape[0] == 1 and q.shape[0] != 1:
+                # Cross-attention cache is computed once per audio file (batch=1)
+                # and broadcasts against the beam-expanded query batch. Flash and
+                # memory-efficient SDPA kernels reject batch broadcasting outright
+                # ("both fused kernels require query, key and value to have the
+                # same batch_size") and silently fall back to the much slower
+                # unfused "math" kernel. Pre-expanding is a stride-0 view (no
+                # copy) that makes the batch dims equal so flash attention runs.
+                k = k.expand(q.shape[0], *k.shape[1:])
+                v = v.expand(q.shape[0], *v.shape[1:])
             a = scaled_dot_product_attention(
                 q, k, v, is_causal=mask is not None and n_ctx > 1
             )
@@ -131,7 +191,6 @@ class MultiHeadAttention(nn.Module):
             if mask is not None:
                 qk = qk + mask[:n_ctx, :n_ctx]
             qk = qk.float()
-
             w = F.softmax(qk, dim=-1).to(q.dtype)
             out = (w @ v).permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = qk.detach()
@@ -184,6 +243,14 @@ class AudioEncoder(nn.Module):
             [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
         )
         self.ln_post = LayerNorm(n_state)
+        # Lazily-initialized dedicated CUDA stream for the encoder.
+        self._encoder_stream: Optional["torch.cuda.Stream"] = None
+
+    def _get_stream(self) -> Optional["torch.cuda.Stream"]:
+        """Create the encoder CUDA stream on first use (lazy init)."""
+        if self._encoder_stream is None and torch.cuda.is_available():
+            self._encoder_stream = torch.cuda.Stream()
+        return self._encoder_stream
 
     def forward(self, x: Tensor):
         """
@@ -193,13 +260,10 @@ class AudioEncoder(nn.Module):
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
-
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
         x = (x + self.positional_embedding).to(x.dtype)
-
         for block in self.blocks:
             x = block(x)
-
         x = self.ln_post(x)
         return x
 
@@ -224,6 +288,19 @@ class TextDecoder(nn.Module):
         mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
+        # Assign integer KV cache indices to every attention layer so that
+        # KV accumulation can happen inside forward() without register_forward_hook.
+        # Even indices → self-attention; odd indices → cross-attention.
+        for i, block in enumerate(self.blocks):
+            block.attn._kv_idx = 2 * i
+            if block.cross_attn is not None:
+                block.cross_attn._kv_idx = 2 * i + 1
+        self._n_kv_entries: int = 2 * n_layer
+        # Note: make_kv_cache() uses mutable lists [k, v] as values (not tuples).
+        # The list object identity is stable across calls (we update list[0]/[1]
+        # in-place rather than replacing the dict value). This prevents dynamo from
+        # emitting ___check_obj_id guards on every call → no cache_size_limit storms.
+
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
@@ -231,7 +308,18 @@ class TextDecoder(nn.Module):
         xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
             the encoded audio features to be attended on
         """
-        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        if kv_cache:
+            first_val = next(iter(kv_cache.values()))
+            if isinstance(first_val, list):
+                # New int-indexed format: [k_or_None, v_or_None] list.
+                offset = 0 if first_val[0] is None else first_val[0].shape[1]
+            elif first_val is None:
+                offset = 0
+            else:
+                # Legacy hook-based format: direct tensor.
+                offset = first_val.shape[1]
+        else:
+            offset = 0
         x = (
             self.token_embedding(x)
             + self.positional_embedding[offset : offset + x.shape[-1]]
@@ -242,9 +330,8 @@ class TextDecoder(nn.Module):
             x = block(x, xa, mask=self.mask, kv_cache=kv_cache)
 
         x = self.ln(x)
-        logits = (
-            x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)
-        ).float()
+        # Use .t() for a zero-copy view-transpose; cast once to avoid extra alloc.
+        logits = (x @ self.token_embedding.weight.to(x.dtype).t()).float()
 
         return logits
 
@@ -267,6 +354,7 @@ class Whisper(nn.Module):
             self.dims.n_text_head,
             self.dims.n_text_layer,
         )
+
         # use the last half among the decoder layers for time alignment by default;
         # to use a specific set of heads, see `set_alignment_heads()` below.
         all_heads = torch.zeros(
@@ -285,6 +373,20 @@ class Whisper(nn.Module):
         self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
 
     def embed_audio(self, mel: torch.Tensor):
+        # Run encoder on a dedicated CUDA stream so the GPU scheduler can
+        # overlap encoder kernels with any CPU-side preparation work.
+        if mel.is_cuda and torch.cuda.is_available():
+            underlying = getattr(self.encoder, "_orig_mod", self.encoder)
+            stream = (
+                underlying._get_stream()
+                if hasattr(underlying, "_get_stream")
+                else None
+            )
+            if stream is not None:
+                with torch.cuda.stream(stream):
+                    result = self.encoder(mel)
+                torch.cuda.current_stream().wait_stream(stream)
+                return result
         return self.encoder(mel)
 
     def logits(self, tokens: torch.Tensor, audio_features: torch.Tensor):
@@ -307,6 +409,18 @@ class Whisper(nn.Module):
     def num_languages(self):
         return self.dims.n_vocab - 51765 - int(self.is_multilingual)
 
+    def make_kv_cache(self) -> dict:
+        """Return a pre-populated integer-indexed KV cache for hook-free decoding.
+
+        The cache is a plain dict ``{idx: None}`` for all attention indices in
+        the decoder.  Passing this to ``decoder.forward`` activates the hook-free
+        path inside ``MultiHeadAttention.forward``; no ``register_forward_hook``
+        calls are needed.  The fixed structure (same set of integer keys, values
+        transitioning from None to (k, v) tuples) is stable across calls, which
+        lets ``torch.compile`` compile the decoder without cache-limit storms.
+        """
+        return {i: [None, None] for i in range(self.decoder._n_kv_entries)}
+
     def install_kv_cache_hooks(self, cache: Optional[dict] = None):
         """
         The `MultiHeadAttention` module optionally accepts `kv_cache` which stores the key and value
@@ -323,17 +437,43 @@ class Whisper(nn.Module):
         """
         cache = {**cache} if cache is not None else {}
         hooks = []
+        _buf: dict = {}  # pre-allocated (batch, n_text_ctx, head_dim) tensors
+        _pos: dict = {}  # current write position in each buffer
 
         def save_to_cache(module, _, output):
             if module not in cache or output.shape[1] > self.dims.n_text_ctx:
-                # save as-is, for the first token or cross attention
+                # cross-attention or very first self-attention token — store as-is
                 cache[module] = output
             else:
-                cache[module] = torch.cat([cache[module], output], dim=1).detach()
+                current = cache[module]
+                b, t, d = current.shape[0], self.dims.n_text_ctx, current.shape[2]
+                same_buf = module in _buf and current.data_ptr() == _buf[module].data_ptr()
+                if same_buf and current.shape[1] == _pos.get(module, -1):
+                    # Normal incremental path — buffer is current, position is known
+                    pos = _pos[module]
+                else:
+                    # Three cases land here:
+                    #  a) first incremental write (module not in _buf)
+                    #  b) beam reorder replaced tensor (different data_ptr)
+                    #  c) external truncation via _truncate_kv (same data_ptr, shorter shape)
+                    # For (c) data is already in the buffer — skip the copy.
+                    if not same_buf:
+                        if module not in _buf or _buf[module].shape != (b, self.dims.n_text_ctx, d):
+                            _buf[module] = torch.empty(b, self.dims.n_text_ctx, d,
+                                                       dtype=output.dtype, device=output.device)
+                        _buf[module][:, :current.shape[1]].copy_(current)
+                    _pos[module] = current.shape[1]
+                    pos = current.shape[1]
+                n = output.shape[1]
+                _buf[module][:, pos:pos + n].copy_(output)
+                _pos[module] = pos + n
+                cache[module] = _buf[module][:, :_pos[module]]
             return cache[module]
 
         def install_hooks(layer: nn.Module):
-            if isinstance(layer, MultiHeadAttention):
+            if isinstance(layer, MultiHeadAttention) and layer._kv_idx is None:
+                # Skip layers using the hook-free int-indexed path to avoid
+                # double-accumulation (hooks would conflict with forward() logic).
                 hooks.append(layer.key.register_forward_hook(save_to_cache))
                 hooks.append(layer.value.register_forward_hook(save_to_cache))
 

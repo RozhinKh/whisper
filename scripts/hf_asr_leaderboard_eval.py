@@ -49,7 +49,7 @@ DATASET_CONFIGS = {
         "streaming": True,
     },
     "common_voice": {
-        "path": "mozilla-foundation/common_voice_15_0",
+        "path": "mozilla-foundation/common_voice_17_0",
         "name": "en",
         "split": "test",
         "audio_col": "audio",
@@ -86,20 +86,32 @@ def main():
                         choices=list(DATASET_CONFIGS.keys()))
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Cap number of samples (None = full dataset)")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="Take every Nth sample (e.g. 13 gives ~200 representative samples from the full 2620)")
     parser.add_argument("--concat-duration", type=float, default=None,
                         help="Concatenate samples into one audio of this length (seconds) and transcribe as a single file")
     parser.add_argument("--compute-type", default="float16",
                         choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
-    parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument("--temperature", default="0.0",
+                        help="Decoding temperature. Single value like '0.0' = no fallback "
+                             "(default). Pass 'fallback' to use Whisper's actual default "
+                             "ladder (0.0,0.2,0.4,0.6,0.8,1.0), which retries a segment at "
+                             "higher temperature when compression_ratio/logprob heuristics "
+                             "flag a bad decode (e.g. a repetition hallucination loop).")
     parser.add_argument("--language", default="en")
     parser.add_argument("--output", default="artemis_results.json")
     args = parser.parse_args()
 
+    if args.temperature.strip().lower() == "fallback":
+        temperature = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+    else:
+        temperature = float(args.temperature)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_name = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
     print(f"Device    : {gpu_name}")
-    print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size})")
+    print(f"Model     : {args.model}  ({args.compute_type}  beam={args.beam_size}  temp={temperature})")
     print(f"Dataset   : {args.dataset}")
     print()
 
@@ -146,6 +158,7 @@ def main():
                 audio_array,
                 language=args.language,
                 beam_size=args.beam_size,
+                temperature=temperature,
                 fp16=(args.compute_type == "float16"),
             )
             if device == "cuda":
@@ -160,9 +173,14 @@ def main():
         n = 1
         print(f"RTF={rtf(duration_s, elapsed):.4f}  elapsed={elapsed:.1f}s")
     else:
+        sample_idx = 0
         for sample in dataset:
             if args.max_samples and n >= args.max_samples:
                 break
+            if sample_idx % args.stride != 0:
+                sample_idx += 1
+                continue
+            sample_idx += 1
 
             audio_array = np.array(sample[cfg["audio_col"]]["array"], dtype=np.float32)
             sampling_rate = sample[cfg["audio_col"]]["sampling_rate"]
@@ -179,6 +197,7 @@ def main():
                     audio_array,
                     language=args.language,
                     beam_size=args.beam_size,
+                    temperature=temperature,
                     fp16=(args.compute_type == "float16"),
                 )
 

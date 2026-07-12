@@ -8,8 +8,7 @@ Usage:
         --audio-dir   /path/to/audio_files \
         --output      results_sequential.json \
         [--compute-type float16] \
-        [--beam-size 5] \
-        [--use-compile]
+        [--beam-size 5]
 """
 
 import argparse
@@ -19,6 +18,8 @@ import time
 
 import torch
 import whisper
+from jiwer import wer as compute_wer
+from whisper.normalizers import EnglishTextNormalizer
 
 
 def load_artemis_manifest(artemis_dir: str):
@@ -50,7 +51,8 @@ def main():
     parser.add_argument("--output", default="results_sequential.json")
     parser.add_argument("--compute-type", default="float16", choices=["float16", "float32"])
     parser.add_argument("--beam-size", type=int, default=5)
-    parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Decoding temperature. 0.0 = greedy with no fallback (default).")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -58,14 +60,9 @@ def main():
     print(f"Model      : large-v3")
     print(f"Compute    : {args.compute_type}")
     print(f"Beam size  : {args.beam_size}")
-    print(f"Compile    : {args.use_compile}")
     print()
 
-    model = whisper.load_model(
-        "large-v3",
-        compute_type=args.compute_type,
-        use_compile=args.use_compile,
-    )
+    model = whisper.load_model("large-v3")
 
     manifest = load_artemis_manifest(args.artemis_dir)
     if manifest is None:
@@ -76,7 +73,9 @@ def main():
         ]
         manifest = [{"audio": f, "reference": ""} for f in sorted(files)]
 
+    normalizer = EnglishTextNormalizer()
     results = []
+    hypotheses, references = [], []
     total_audio_s = 0.0
     total_infer_s = 0.0
 
@@ -97,6 +96,7 @@ def main():
         result = model.transcribe(
             audio_path,
             beam_size=args.beam_size,
+            temperature=args.temperature,
             fp16=(args.compute_type == "float16"),
         )
 
@@ -116,20 +116,26 @@ def main():
             "language": result.get("language", ""),
         }
         results.append(entry_result)
+        if entry.get("reference"):
+            hypotheses.append(normalizer(entry_result["hypothesis"]))
+            references.append(normalizer(entry["reference"]))
         print(f"[{i+1}/{len(manifest)}] {entry['audio']:40s}  RTF={entry_result['rtf']:.3f}  {elapsed:.2f}s")
+
+    overall_wer = 100 * compute_wer(references, hypotheses) if references else None
 
     summary = {
         "config": {
             "model": "large-v3",
             "compute_type": args.compute_type,
             "beam_size": args.beam_size,
-            "use_compile": args.use_compile,
             "device": torch.cuda.get_device_name(0) if device == "cuda" else "cpu",
         },
         "total_audio_s": total_audio_s,
         "total_inference_s": total_infer_s,
         "overall_rtf": rtf(total_audio_s, total_infer_s),
+        "overall_wer": overall_wer,
         "n_files": len(results),
+        "n_scored": len(references),
         "results": results,
     }
 
@@ -137,6 +143,10 @@ def main():
         json.dump(summary, f, indent=2)
 
     print(f"\nOverall RTF : {summary['overall_rtf']:.4f}")
+    if overall_wer is not None:
+        print(f"Overall WER : {overall_wer:.3f}%  ({len(references)}/{len(results)} files had references)")
+    else:
+        print("Overall WER : n/a (no reference text in manifest)")
     print(f"Results     : {args.output}")
 
 

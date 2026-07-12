@@ -146,12 +146,13 @@ def log_mel_spectrogram(
         audio = F.pad(audio, (0, padding))
     window = torch.hann_window(N_FFT).to(audio.device)
     stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
-    magnitudes = stft[..., :-1].abs() ** 2
+    s = stft[..., :-1]
+    magnitudes = s.real.square().add_(s.imag.square())  # avoids sqrt inside abs()
 
     filters = mel_filters(audio.device, n_mels)
     mel_spec = filters @ magnitudes
 
-    log_spec = torch.clamp(mel_spec, min=1e-10).log10()
-    log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
+    log_spec = mel_spec.clamp_(min=1e-10).log10_()
+    log_spec.clamp_(min=log_spec.max().item() - 8.0)
+    log_spec.add_(4.0).div_(4.0)
     return log_spec

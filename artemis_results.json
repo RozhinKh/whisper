@@ -1,0 +1,14 @@
+[
+  {
+    "dataset": "librispeech_asr",
+    "model": "large-v3",
+    "compute_type": "float16",
+    "beam_size": 5,
+    "device": "NVIDIA GeForce RTX 3090",
+    "n_samples": 100,
+    "wer": 1.376,
+    "rtf": 0.1546,
+    "total_audio_hours": 0.19,
+    "total_inference_min": 1.7
+  }
+]
