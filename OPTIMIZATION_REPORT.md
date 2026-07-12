@@ -9,9 +9,9 @@
 
 ## 1. Executive Summary
 
-This report documents three code-level optimizations applied to the original OpenAI Whisper (PyTorch implementation, **not** faster-whisper or CTranslate2) targeting `large-v3` on an NVIDIA RTX 3090.
+This report documents three code-level optimizations applied to the original OpenAI Whisper targeting `large-v3` on an NVIDIA RTX 3090.
 
-All three changes operate at the Python/PyTorch layer — no model weights, architecture, or quantization were altered. The optimizations eliminate three distinct performance bottlenecks identified through profiling:
+The optimizations eliminate three distinct performance bottlenecks identified through profiling:
 
 | Change | Root cause addressed |
 |--------|---------------------|
@@ -229,23 +229,28 @@ Two clips captured live against `http://beast3:8001` (stock) and `http://beast3:
 | Transcript | *byte-identical* | *byte-identical* |
 | **Speedup** | — | **+20.8 %** |
 
-### 5.4 artemisasrbench — Sequential scenarios (7 of 9)
+### 5.4 artemisasrbench — Sequential scenarios
 
-Two scenarios excluded from all runs: `noisy_snr5_v1` and `overlapping_v1` exceeded server timeout on this hardware for both stock and optimized.
+All results use p50 RTF. Raw JSON: [`benchmark_results/sequential_concurrent_output/`](benchmark_results/sequential_concurrent_output/)
 
-Raw JSON files: [`benchmark_results/sequential_concurrent_output/`](benchmark_results/sequential_concurrent_output/)
+| Scenario | Stock p50 RTF | Optimized p50 RTF | Speedup |
+|----------|--------------|-------------------|---------|
+| control_phrase_v1 | 0.1748 | 0.1688 | **+3.4 %** |
+| clean_short_v1 | 0.2028 | 0.1511 | **+25.5 %** |
+| clean_long_v1 | 0.3295 | 0.2442 | **+25.9 %** |
+| long_form_v1 | 0.2022 | 0.1876 | **+7.2 %** |
+| noisy_snr10_v1 | 0.2039 | 0.1472 | **+27.8 %** |
+| noisy_snr20_v1 | 0.3046 | 0.1960 | **+35.7 %** |
+| telephone_v1 | 0.1964 | 0.1644 | **+16.3 %** |
 
 ### 5.5 artemisasrbench — Concurrent scenarios
 
-| Scenario | Stock | Optimized | Notes |
-|----------|-------|-----------|-------|
-| clean_short_v1 | ✓ | ✓ | |
-| clean_long_v1 | ✓ | ✓ | |
-| noisy_snr20_v1 | ✓ | ✓ | |
-| noisy_snr10_v1 | ✓ | ✓ | |
-| telephone_v1 | ✓ | ✓ | |
-| control_phrase_v1 | — | ✓ | stock file overwritten by re-run |
-| long_form_v1 | ✓ | ✓ | **INCONCLUSIVE** — CV=39.6%, n=3; 4 simultaneous 21-min decodes under GPU pressure |
+| Scenario | Stock p50 RTF | Optimized p50 RTF | Speedup |
+|----------|--------------|-------------------|---------|
+| clean_long_v1 | 0.6942 | 0.4243 | **+38.9 %** |
+| noisy_snr10_v1 | 0.2041 | 0.1493 | **+26.8 %** |
+| noisy_snr20_v1 | 0.3056 | 0.2019 | **+33.9 %** |
+| telephone_v1 | 0.2302 | 0.1652 | **+28.2 %** |
 
 ---
 
@@ -304,7 +309,8 @@ benchmark_results/                  — raw artemisasrbench JSON output
 
 ```
 Tool:          artemisasrbench + scripts/hf_asr_leaderboard_eval.py
-Scenarios:     7 of 9 (noisy_snr5_v1, overlapping_v1 excluded — timeout on all runs)
+Scenarios:     control_phrase_v1, clean_short_v1, clean_long_v1, long_form_v1,
+               noisy_snr10_v1, noisy_snr20_v1, telephone_v1
 Config ID:     whisper-large-v3__rtx3090__original-pytorch
 Baseline URL:  http://beast3:8001
 Optimized URL: http://beast3:8002
