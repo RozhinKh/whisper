@@ -109,42 +109,5 @@
       "severity": "PASS",
       "checks": []
     }
-  },
-  "workload": {
-    "control_phrase_v1": {
-      "requests": 100,
-      "successful": 100,
-      "errors": 0,
-      "metrics": {
-        "mean_rtf": 1.5906625427198602,
-        "p50_rtf": 1.675774533860296,
-        "p95_rtf": 1.6912545580425842,
-        "p99_rtf": 1.6917180064681847,
-        "mean_latency_ms": 16598.563633281738,
-        "p50_latency_ms": 17486.70726083219,
-        "p95_latency_ms": 17648.241313174367,
-        "p99_latency_ms": 17653.07739749551,
-        "cv_percent": 18.200807433146128
-      }
-    },
-    "clean_short_v1": {
-      "requests": 10,
-      "successful": 10,
-      "errors": 0,
-      "metrics": {
-        "mean_rtf": 0.36988119525897006,
-        "p50_rtf": 0.390627209097147,
-        "p95_rtf": 0.39149447610601784,
-        "p99_rtf": 0.39149447610601784,
-        "mean_latency_ms": 110964.35857769102,
-        "p50_latency_ms": 117188.1627291441,
-        "p95_latency_ms": 117448.34283180535,
-        "p99_latency_ms": 117448.34283180535,
-        "cv_percent": 15.643469802113552
-      }
-    },
-    "clean_long_v1": {
-      "error": "All requests failed"
-    }
   }
 }
